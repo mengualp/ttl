@@ -492,6 +492,63 @@ ttl 8.8.8.8 -c 100 --report
 
 Human-readable summary similar to mtr report mode.
 
+### Streaming JSON
+
+```bash
+ttl 8.8.8.8 --stream-json                    # One JSON event per line
+ttl 8.8.8.8 --stream-json -c 10 | jq .       # Finite run, piped to jq
+ttl 8.8.8.8 --stream-json | jq 'select(.type == "timeout")'
+```
+
+Emits each probe event as a single line of JSON on stdout (NDJSON), suitable
+for piping into `jq`, `grep`, or monitoring pipelines. Implies `--no-tui` and
+runs until `-c` rounds complete or Ctrl-C.
+
+Event lines match the schema of the `events` array in saved session files,
+with a `target` field added for demultiplexing multi-target runs:
+
+```json
+{"target":"8.8.8.8","offset_ms":1052,"ttl":5,"seq":1,"flow_id":0,"type":"reply","addr":"192.178.105.139","rtt_us":12500}
+{"target":"8.8.8.8","offset_ms":4021,"ttl":7,"seq":1,"flow_id":0,"type":"timeout"}
+```
+
+Event types are `reply`, `timeout`, and `late_reply`. When the stream ends, a
+final `summary` line is emitted per target:
+
+```json
+{"target":"8.8.8.8","type":"summary","complete":true,"dest_ttl":13,"total_sent":130,"hops_responding":12}
+```
+
+### Trace Diff
+
+```bash
+ttl --diff before.json after.json            # Human-readable comparison
+ttl --diff before.json after.json --json     # Machine-readable diff
+```
+
+Compare two saved sessions hop by hop. Reports:
+
+- **`[path]`** — primary responder changed at a hop
+- **`[added]`** / **`[lost]`** — hop responds in only one session
+- **Responder-set changes** — ECMP responders that appeared or disappeared
+- **Latency shifts** — avg RTT deltas, highlighted when ≥5ms *and* ≥20% of the
+  before value
+- **Loss changes** and destination reachability
+
+```
+Trace diff: 8.8.8.8
+  before: before.json  (2026-06-09 14:00:12 UTC)
+  after:  after.json   (2026-06-10 09:30:44 UTC)
+
+ TTL  Before           After            Change       Avg RTT (ms)       Loss (%)
+   1  192.168.1.1      192.168.1.1                    2.0 →     2.1    0.0 →   0.0
+   2  10.0.2.1         10.0.2.99        [path]        8.0 →     9.0    0.0 →   0.0
+   3  10.0.3.1         *                [lost]       12.0 →       -    0.0 →     -
+
+Summary: 1 path change(s), 0 hop(s) added, 1 hop(s) lost, 0 significant latency shift(s)
+  destination reached in both (5 → 5 hops)
+```
+
 ### Session Replay
 
 ```bash
@@ -559,6 +616,8 @@ Options:
       --report           Batch report mode (requires -c)
       --json             JSON output (requires -c)
       --csv              CSV output (requires -c)
+      --stream-json      Stream probe events as line-delimited JSON (implies --no-tui)
+      --diff <BEFORE> <AFTER>  Compare two saved sessions (with --json for JSON output)
       --replay <FILE>    Replay a saved JSON session
       --animate          Animate replay (show probe-by-probe discovery)
       --speed <N>        Replay speed multiplier (default: 10.0, requires --animate)

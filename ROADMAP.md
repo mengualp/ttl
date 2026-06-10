@@ -115,11 +115,11 @@
 
 **Why this matters:** Users frequently need to compare traces taken at different times (before/after a change, during/after an incident). Streaming output enables integration with monitoring pipelines.
 
-- [ ] Trace comparison (`ttl --diff trace1.json trace2.json`)
-- [ ] Show added/removed/changed hops between two sessions
-- [ ] Highlight latency and path changes
-- [ ] Streaming JSON output (`--stream-json`) for piping to other tools
-- [ ] Line-delimited JSON (one event per line, composable with jq/grep)
+- [x] Trace comparison (`ttl --diff trace1.json trace2.json`)
+- [x] Show added/removed/changed hops between two sessions
+- [x] Highlight latency and path changes
+- [x] Streaming JSON output (`--stream-json`) for piping to other tools
+- [x] Line-delimited JSON (one event per line, composable with jq/grep)
 
 ### Docker & Daemon Mode
 

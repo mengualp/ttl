@@ -27,6 +27,10 @@ EXAMPLES:
     Export results:
         ttl -c 100 --json host > out.json
 
+    Stream and compare:
+        ttl --stream-json host | jq .   # Line-delimited JSON events
+        ttl --diff before.json after.json
+
 DETECTION INDICATORS:
     [NAT]  - Source port rewriting detected (affects multi-flow accuracy)
     [RL?]  - Router rate-limiting ICMP (loss may be artificial)
@@ -41,7 +45,7 @@ For detailed documentation: https://github.com/lance0/ttl/blob/master/docs/FEATU
 ")]
 pub struct Args {
     /// Target hosts to trace (IP address or hostname)
-    #[arg(required_unless_present_any = ["completions", "replay"])]
+    #[arg(required_unless_present_any = ["completions", "replay", "diff"])]
     pub targets: Vec<String>,
 
     /// Number of probe rounds (0 = infinite). Each round sends probes to all TTLs.
@@ -139,6 +143,14 @@ pub struct Args {
     /// Replay speed multiplier (1.0 = realtime, 10.0 = 10x faster)
     #[arg(long = "speed", default_value = "10.0", requires = "animate")]
     pub speed: f32,
+
+    /// Compare two saved sessions: show added/removed hops, path and latency changes
+    #[arg(long = "diff", num_args = 2, value_names = ["BEFORE", "AFTER"], conflicts_with_all = ["targets", "replay"])]
+    pub diff: Option<Vec<String>>,
+
+    /// Stream probe events as line-delimited JSON to stdout (implies --no-tui)
+    #[arg(long = "stream-json", conflicts_with_all = ["json", "csv", "report", "replay", "diff"])]
+    pub stream_json: bool,
 
     /// Color theme (default, kawaii, cyber, dracula, monochrome, matrix, nord, gruvbox, catppuccin, tokyo_night, solarized)
     #[arg(long = "theme", default_value = "default")]
@@ -325,6 +337,8 @@ mod tests {
             replay: None,
             animate: false,
             speed: 10.0,
+            diff: None,
+            stream_json: false,
             theme: "default".to_string(),
             wide: false,
             interface: None,
@@ -392,5 +406,38 @@ mod tests {
         });
         let err = args.validate().unwrap_err();
         assert!(err.contains("sequence wrap"));
+    }
+
+    #[test]
+    fn test_diff_parses_two_files_without_targets() {
+        let args = Args::try_parse_from(["ttl", "--diff", "before.json", "after.json"]).unwrap();
+        assert_eq!(
+            args.diff,
+            Some(vec!["before.json".to_string(), "after.json".to_string()])
+        );
+        assert!(args.targets.is_empty());
+    }
+
+    #[test]
+    fn test_diff_requires_exactly_two_files() {
+        assert!(Args::try_parse_from(["ttl", "--diff", "only-one.json"]).is_err());
+    }
+
+    #[test]
+    fn test_diff_conflicts_with_targets() {
+        assert!(Args::try_parse_from(["ttl", "--diff", "a.json", "b.json", "8.8.8.8"]).is_err());
+    }
+
+    #[test]
+    fn test_stream_json_parses_with_target() {
+        let args = Args::try_parse_from(["ttl", "--stream-json", "8.8.8.8"]).unwrap();
+        assert!(args.stream_json);
+    }
+
+    #[test]
+    fn test_stream_json_conflicts_with_batch_output() {
+        assert!(Args::try_parse_from(["ttl", "--stream-json", "--json", "8.8.8.8"]).is_err());
+        assert!(Args::try_parse_from(["ttl", "--stream-json", "--csv", "8.8.8.8"]).is_err());
+        assert!(Args::try_parse_from(["ttl", "--stream-json", "--report", "8.8.8.8"]).is_err());
     }
 }
