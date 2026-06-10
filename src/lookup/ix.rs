@@ -88,10 +88,134 @@ impl IxCache {
     }
 }
 
-/// In-memory prefix entry for fast lookup
-struct PrefixEntry {
-    network: IpNetwork,
-    info: IxInfo,
+/// Node in a binary radix trie over IP address bits
+///
+/// Children are indices into the trie's flat node arena; `info` is an index
+/// into the owning table's `IxInfo` vec, set on nodes that terminate a prefix.
+#[derive(Debug, Default, Clone)]
+struct TrieNode {
+    children: [Option<u32>; 2],
+    info: Option<u32>,
+}
+
+/// Binary radix trie for longest-prefix-match over IP address bits
+///
+/// Lookup walks one bit per level from the most significant bit, so it costs
+/// O(address bits) regardless of how many prefixes are loaded. Address bits
+/// are passed left-aligned in a `u128` (IPv4 occupies the top 32 bits).
+#[derive(Debug)]
+struct PrefixTrie {
+    /// Node arena; index 0 is the root
+    nodes: Vec<TrieNode>,
+}
+
+impl PrefixTrie {
+    fn new() -> Self {
+        Self {
+            nodes: vec![TrieNode::default()],
+        }
+    }
+
+    /// Insert a prefix, mapping its terminal node to `info_idx`
+    ///
+    /// Only the first `prefix_len` bits are walked, so host bits in the
+    /// network address are ignored (matching `IpNetwork::contains`). The
+    /// first insertion of a given prefix wins, preserving the old behavior
+    /// where a stable sort kept earlier duplicates ahead of later ones.
+    fn insert(&mut self, bits: u128, prefix_len: u8, info_idx: u32) {
+        let mut node = 0usize;
+        for i in 0..prefix_len {
+            let bit = ((bits >> (127 - i)) & 1) as usize;
+            node = match self.nodes[node].children[bit] {
+                Some(child) => child as usize,
+                None => {
+                    self.nodes.push(TrieNode::default());
+                    let child = (self.nodes.len() - 1) as u32;
+                    self.nodes[node].children[bit] = Some(child);
+                    child as usize
+                }
+            };
+        }
+        if self.nodes[node].info.is_none() {
+            self.nodes[node].info = Some(info_idx);
+        }
+    }
+
+    /// Find the most specific prefix containing the address bits
+    fn lookup(&self, bits: u128, addr_len: u8) -> Option<u32> {
+        let mut node = 0usize;
+        // Root info covers a /0 prefix (matches everything)
+        let mut best = self.nodes[0].info;
+        for i in 0..addr_len {
+            let bit = ((bits >> (127 - i)) & 1) as usize;
+            match self.nodes[node].children[bit] {
+                Some(child) => {
+                    node = child as usize;
+                    if let Some(info) = self.nodes[node].info {
+                        best = Some(info);
+                    }
+                }
+                None => break,
+            }
+        }
+        best
+    }
+}
+
+/// Convert an IP address to left-aligned bits and its bit width
+fn addr_bits(ip: IpAddr) -> (u128, u8) {
+    match ip {
+        IpAddr::V4(v4) => ((u32::from(v4) as u128) << 96, 32),
+        IpAddr::V6(v6) => (u128::from(v6), 128),
+    }
+}
+
+/// In-memory prefix table: per-family radix tries plus the IX info they reference
+#[derive(Debug)]
+struct PrefixTable {
+    v4: PrefixTrie,
+    v6: PrefixTrie,
+    infos: Vec<IxInfo>,
+    /// Number of inserted prefixes (for cache status display)
+    len: usize,
+}
+
+impl PrefixTable {
+    fn new() -> Self {
+        Self {
+            v4: PrefixTrie::new(),
+            v6: PrefixTrie::new(),
+            infos: Vec::new(),
+            len: 0,
+        }
+    }
+
+    /// Insert a network prefix with its IX info
+    fn insert(&mut self, network: &IpNetwork, info: IxInfo) {
+        let info_idx = self.infos.len() as u32;
+        self.infos.push(info);
+        let (bits, _) = addr_bits(network.network());
+        match network {
+            IpNetwork::V4(_) => self.v4.insert(bits, network.prefix(), info_idx),
+            IpNetwork::V6(_) => self.v6.insert(bits, network.prefix(), info_idx),
+        }
+        self.len += 1;
+    }
+
+    /// Longest-prefix-match lookup for an IP address
+    fn lookup(&self, ip: IpAddr) -> Option<&IxInfo> {
+        let (bits, addr_len) = addr_bits(ip);
+        let trie = match ip {
+            IpAddr::V4(_) => &self.v4,
+            IpAddr::V6(_) => &self.v6,
+        };
+        trie.lookup(bits, addr_len)
+            .map(|idx| &self.infos[idx as usize])
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
 }
 
 /// Status of the PeeringDB cache for display in settings
@@ -112,8 +236,8 @@ pub struct CacheStatus {
 /// IX lookup via PeeringDB prefix matching
 pub struct IxLookup {
     /// Parsed prefixes for lookup (populated from cache or API)
-    /// Sorted by prefix length descending for longest-prefix-match
-    prefixes: RwLock<Vec<PrefixEntry>>,
+    /// Radix tries keyed on address bits for O(prefix_len) longest-prefix-match
+    prefixes: RwLock<PrefixTable>,
     /// Cache file path
     cache_path: PathBuf,
     /// OnceCell ensures successful load runs exactly once
@@ -153,7 +277,7 @@ impl IxLookup {
         let cache_path = cache_dir.join("ix_cache.json");
 
         Ok(Self {
-            prefixes: RwLock::new(Vec::new()),
+            prefixes: RwLock::new(PrefixTable::new()),
             cache_path,
             load_once: OnceCell::new(),
             last_failure: AtomicU64::new(0),
@@ -217,15 +341,8 @@ impl IxLookup {
             }
         }
 
-        // Search prefixes for longest matching network
-        // (prefixes are sorted by length descending, so first match is longest)
-        let result = {
-            let prefixes = self.prefixes.read();
-            prefixes
-                .iter()
-                .find(|entry| entry.network.contains(ip))
-                .map(|entry| entry.info.clone())
-        };
+        // Radix trie lookup returns the longest matching prefix
+        let result = self.prefixes.read().lookup(ip).cloned();
 
         // Cache result
         {
@@ -293,27 +410,23 @@ impl IxLookup {
 
     /// Populate prefixes from cache
     fn populate_from_cache(&self, cache: &IxCache) -> Result<()> {
-        let mut entries = Vec::with_capacity(cache.prefixes.len());
+        let mut table = PrefixTable::new();
 
         for p in &cache.prefixes {
             if let Ok(network) = p.prefix.parse::<IpNetwork>() {
-                entries.push(PrefixEntry {
-                    network,
-                    // Sanitize IX names for safe terminal display
-                    info: IxInfo {
+                // Sanitize IX names for safe terminal display
+                table.insert(
+                    &network,
+                    IxInfo {
                         name: sanitize_display(&p.ix_name),
                         city: p.ix_city.as_ref().map(|s| sanitize_display(s)),
                         country: p.ix_country.as_ref().map(|s| sanitize_display(s)),
                     },
-                });
+                );
             }
         }
 
-        // Sort by prefix length descending for longest-prefix-match
-        // This ensures more specific prefixes are checked first
-        entries.sort_by_key(|e| std::cmp::Reverse(e.network.prefix()));
-
-        *self.prefixes.write() = entries;
+        *self.prefixes.write() = table;
         Ok(())
     }
 
@@ -598,15 +711,94 @@ mod tests {
     use super::*;
     use std::net::Ipv4Addr;
 
-    #[test]
-    fn test_prefix_matching() {
-        // Test IpNetwork contains check
-        let network: IpNetwork = "206.223.115.0/24".parse().unwrap();
-        let inside = IpAddr::V4(Ipv4Addr::new(206, 223, 115, 100));
-        let outside = IpAddr::V4(Ipv4Addr::new(206, 223, 116, 100));
+    /// Build a PrefixTable from (prefix, ix_name) pairs
+    fn table_with(entries: &[(&str, &str)]) -> PrefixTable {
+        let mut table = PrefixTable::new();
+        for (prefix, name) in entries {
+            table.insert(
+                &prefix.parse().unwrap(),
+                IxInfo {
+                    name: name.to_string(),
+                    city: None,
+                    country: None,
+                },
+            );
+        }
+        table
+    }
 
-        assert!(network.contains(inside));
-        assert!(!network.contains(outside));
+    /// Lookup an IP in a PrefixTable, returning the matched IX name
+    fn lookup_name(table: &PrefixTable, ip: &str) -> Option<String> {
+        table
+            .lookup(ip.parse().unwrap())
+            .map(|info| info.name.clone())
+    }
+
+    #[test]
+    fn test_trie_ipv4_match() {
+        let table = table_with(&[("206.223.115.0/24", "Equinix Ashburn")]);
+
+        assert_eq!(
+            lookup_name(&table, "206.223.115.100"),
+            Some("Equinix Ashburn".to_string())
+        );
+        assert_eq!(lookup_name(&table, "206.223.116.100"), None);
+        assert_eq!(lookup_name(&table, "8.8.8.8"), None);
+    }
+
+    #[test]
+    fn test_trie_ipv6_match() {
+        let table = table_with(&[("2001:7f8::/32", "DE-CIX Frankfurt")]);
+
+        assert_eq!(
+            lookup_name(&table, "2001:7f8::1"),
+            Some("DE-CIX Frankfurt".to_string())
+        );
+        assert_eq!(
+            lookup_name(&table, "2001:7f8:ffff::1"),
+            Some("DE-CIX Frankfurt".to_string())
+        );
+        assert_eq!(lookup_name(&table, "2001:7f9::1"), None);
+        assert_eq!(lookup_name(&table, "2606:4700::1"), None);
+    }
+
+    #[test]
+    fn test_trie_family_separation() {
+        // An IPv4 prefix must not match IPv6 addresses and vice versa
+        let table = table_with(&[("10.0.0.0/8", "V4 IX"), ("2001:db8::/32", "V6 IX")]);
+
+        assert_eq!(lookup_name(&table, "10.1.2.3"), Some("V4 IX".to_string()));
+        assert_eq!(
+            lookup_name(&table, "2001:db8::1"),
+            Some("V6 IX".to_string())
+        );
+        // IPv4-mapped IPv6 address is an IPv6 lookup; should not hit the v4 trie
+        assert_eq!(lookup_name(&table, "::ffff:10.1.2.3"), None);
+    }
+
+    #[test]
+    fn test_trie_host_prefix_edge_cases() {
+        // /32 and /128 prefixes match exactly one address
+        let table = table_with(&[("192.0.2.1/32", "V4 Host"), ("2001:db8::1/128", "V6 Host")]);
+
+        assert_eq!(
+            lookup_name(&table, "192.0.2.1"),
+            Some("V4 Host".to_string())
+        );
+        assert_eq!(lookup_name(&table, "192.0.2.2"), None);
+        assert_eq!(
+            lookup_name(&table, "2001:db8::1"),
+            Some("V6 Host".to_string())
+        );
+        assert_eq!(lookup_name(&table, "2001:db8::2"), None);
+    }
+
+    #[test]
+    fn test_trie_empty() {
+        let table = PrefixTable::new();
+        assert_eq!(table.len(), 0);
+        assert_eq!(lookup_name(&table, "192.0.2.1"), None);
+        assert_eq!(lookup_name(&table, "2001:db8::1"), None);
     }
 
     #[test]
@@ -634,57 +826,33 @@ mod tests {
     }
 
     #[test]
-    fn test_longest_prefix_match_sorting() {
-        // Verify that prefixes are sorted by length descending
-        let mut entries = [
-            PrefixEntry {
-                network: "10.0.0.0/8".parse().unwrap(),
-                info: IxInfo {
-                    name: "Wide".to_string(),
-                    city: None,
-                    country: None,
-                },
-            },
-            PrefixEntry {
-                network: "10.0.0.0/24".parse().unwrap(),
-                info: IxInfo {
-                    name: "Narrow".to_string(),
-                    city: None,
-                    country: None,
-                },
-            },
-            PrefixEntry {
-                network: "10.0.0.0/16".parse().unwrap(),
-                info: IxInfo {
-                    name: "Medium".to_string(),
-                    city: None,
-                    country: None,
-                },
-            },
-        ];
+    fn test_trie_longest_prefix_match() {
+        // Nested prefixes: lookup must return the most specific match
+        let table = table_with(&[
+            ("10.0.0.0/8", "Wide"),
+            ("10.0.0.0/24", "Narrow"),
+            ("10.0.0.0/16", "Medium"),
+        ]);
+        assert_eq!(table.len(), 3);
 
-        // Sort by prefix length descending (same as populate_from_cache)
-        entries.sort_by_key(|e| std::cmp::Reverse(e.network.prefix()));
+        assert_eq!(lookup_name(&table, "10.0.0.50"), Some("Narrow".to_string()));
+        assert_eq!(lookup_name(&table, "10.0.5.50"), Some("Medium".to_string()));
+        assert_eq!(lookup_name(&table, "10.5.0.50"), Some("Wide".to_string()));
+        assert_eq!(lookup_name(&table, "11.0.0.50"), None);
+    }
 
-        // First entry should be /24 (most specific)
-        assert_eq!(entries[0].network.prefix(), 24);
-        assert_eq!(entries[0].info.name, "Narrow");
+    #[test]
+    fn test_trie_overlapping_v6_prefixes() {
+        let table = table_with(&[("2001:db8::/32", "Wide"), ("2001:db8:1::/48", "Narrow")]);
 
-        // Second should be /16
-        assert_eq!(entries[1].network.prefix(), 16);
-        assert_eq!(entries[1].info.name, "Medium");
-
-        // Third should be /8 (least specific)
-        assert_eq!(entries[2].network.prefix(), 8);
-        assert_eq!(entries[2].info.name, "Wide");
-
-        // Now verify find() returns the most specific match
-        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 50));
-        let result = entries
-            .iter()
-            .find(|e| e.network.contains(ip))
-            .map(|e| e.info.name.clone());
-        assert_eq!(result, Some("Narrow".to_string()));
+        assert_eq!(
+            lookup_name(&table, "2001:db8:1::1"),
+            Some("Narrow".to_string())
+        );
+        assert_eq!(
+            lookup_name(&table, "2001:db8:2::1"),
+            Some("Wide".to_string())
+        );
     }
 
     #[test]
@@ -712,7 +880,7 @@ mod tests {
         let cache_path = temp_dir.join("ix_cache.json");
 
         let lookup = IxLookup {
-            prefixes: RwLock::new(Vec::new()),
+            prefixes: RwLock::new(PrefixTable::new()),
             cache_path,
             load_once: OnceCell::new(),
             last_failure: AtomicU64::new(0),
@@ -751,7 +919,7 @@ mod tests {
         let cache_path = temp_dir.join("ix_cache.json");
 
         let lookup = IxLookup {
-            prefixes: RwLock::new(Vec::new()),
+            prefixes: RwLock::new(PrefixTable::new()),
             cache_path: cache_path.clone(),
             load_once: OnceCell::new(),
             last_failure: AtomicU64::new(0),
@@ -787,15 +955,18 @@ mod tests {
         let _ = fs::create_dir_all(&temp_dir);
         let cache_path = temp_dir.join("ix_cache.json");
 
+        let mut table = PrefixTable::new();
+        table.insert(
+            &"206.223.115.0/24".parse().unwrap(),
+            IxInfo {
+                name: "Test IX".to_string(),
+                city: Some("Test City".to_string()),
+                country: Some("US".to_string()),
+            },
+        );
+
         let lookup = IxLookup {
-            prefixes: RwLock::new(vec![PrefixEntry {
-                network: "206.223.115.0/24".parse().unwrap(),
-                info: IxInfo {
-                    name: "Test IX".to_string(),
-                    city: Some("Test City".to_string()),
-                    country: Some("US".to_string()),
-                },
-            }]),
+            prefixes: RwLock::new(table),
             cache_path,
             load_once: OnceCell::const_new_with(()), // Pre-filled = loaded
             last_failure: AtomicU64::new(0),
@@ -831,14 +1002,7 @@ mod tests {
         let cache_path = temp_dir.join("ix_cache.json");
 
         let lookup = IxLookup {
-            prefixes: RwLock::new(vec![PrefixEntry {
-                network: "206.223.115.0/24".parse().unwrap(),
-                info: IxInfo {
-                    name: "Cached IX".to_string(),
-                    city: None,
-                    country: None,
-                },
-            }]),
+            prefixes: RwLock::new(table_with(&[("206.223.115.0/24", "Cached IX")])),
             cache_path,
             load_once: OnceCell::const_new_with(()),
             last_failure: AtomicU64::new(0),
