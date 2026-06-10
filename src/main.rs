@@ -22,7 +22,10 @@ mod update;
 
 use cli::Args;
 use config::{Config, ProbeProtocol};
-use export::{export_csv, export_json, generate_report};
+use export::{
+    diff_sessions, export_csv, export_json, generate_report, write_diff_json, write_diff_text,
+    write_event_line, write_summary_line,
+};
 use lookup::asn::{AsnLookup, run_asn_worker};
 use lookup::geo::{GeoLookup, run_geo_worker};
 use lookup::ix::{IxLookup, run_ix_worker};
@@ -51,6 +54,11 @@ async fn main() -> Result<()> {
     // Handle replay mode (quick viewing operation, no update check)
     if let Some(ref replay_path) = args.replay {
         return run_replay_mode(&args, replay_path).await;
+    }
+
+    // Handle diff mode (compare two saved sessions, no probing)
+    if let Some(ref diff_files) = args.diff {
+        return run_diff_mode(&diff_files[0], &diff_files[1], args.json);
     }
 
     // Spawn background update check after early exits
@@ -314,7 +322,7 @@ async fn main() -> Result<()> {
             resolve_info,
         )
         .await
-    } else if args.no_tui {
+    } else if args.no_tui || args.stream_json {
         run_streaming_mode(
             args,
             sessions,
@@ -404,20 +412,45 @@ fn config_for_target_effective_flows(
 fn load_session(path: &str) -> Result<Session> {
     const MAX_REPLAY_SIZE: u64 = 10 * 1024 * 1024; // 10MB
 
-    let file = File::open(path).with_context(|| format!("Failed to open replay file: {}", path))?;
+    let file =
+        File::open(path).with_context(|| format!("Failed to open session file: {}", path))?;
 
     // Check file size to prevent DoS via huge JSON
     let metadata = file
         .metadata()
-        .with_context(|| format!("Failed to read replay file metadata: {}", path))?;
+        .with_context(|| format!("Failed to read session file metadata: {}", path))?;
     if metadata.len() > MAX_REPLAY_SIZE {
-        anyhow::bail!("Replay file too large (max 10MB): {}", path);
+        anyhow::bail!("Session file too large (max 10MB): {}", path);
     }
 
     let reader = BufReader::new(file);
     let session: Session = serde_json::from_reader(reader)
-        .with_context(|| format!("Failed to parse replay file: {}", path))?;
+        .with_context(|| format!("Failed to parse session file: {}", path))?;
     Ok(session)
+}
+
+/// Run diff mode - compare two saved sessions and print the differences
+fn run_diff_mode(before_path: &str, after_path: &str, json: bool) -> Result<()> {
+    let before = load_session(before_path)?;
+    let after = load_session(after_path)?;
+
+    if before.target.resolved != after.target.resolved {
+        eprintln!(
+            "Warning: sessions trace different targets ({} vs {})",
+            before.target.resolved, after.target.resolved
+        );
+    }
+
+    let diff = diff_sessions(&before, &after, before_path, after_path);
+    let stdout = std::io::stdout();
+    if json {
+        write_diff_json(&diff, stdout.lock())?;
+        println!();
+    } else {
+        let color = is_terminal::is_terminal(std::io::stdout());
+        write_diff_text(&diff, stdout.lock(), color)?;
+    }
+    Ok(())
 }
 
 /// Run replay mode - load a saved session and display/export it
@@ -1256,6 +1289,7 @@ async fn run_streaming_mode(
     let ratelimit_handle = tokio::spawn(run_ratelimit_worker(sessions.clone(), cancel.clone()));
 
     // Print results as they come in
+    let stream_json = args.stream_json;
     let mut last_total_received: HashMap<IpAddr, u64> = HashMap::new();
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
 
@@ -1265,6 +1299,10 @@ async fn run_streaming_mode(
                 break;
             }
             _ = interval.tick() => {
+                if stream_json {
+                    emit_stream_events(&sessions, &targets)?;
+                    continue;
+                }
                 let sessions_read = sessions.read();
                 for target_ip in &targets {
                     if let Some(state) = sessions_read.get(target_ip) {
@@ -1335,6 +1373,49 @@ async fn run_streaming_mode(
     ratelimit_handle.await?;
     shutdown_log("streaming ratelimit worker joined");
 
+    // Final drain: emit events recorded between loop exit and receiver join,
+    // then a per-target summary line
+    if stream_json {
+        emit_stream_events(&sessions, &targets)?;
+        let mut out = std::io::stdout().lock();
+        let sessions_read = sessions.read();
+        for target_ip in &targets {
+            if let Some(state) = sessions_read.get(target_ip) {
+                write_summary_line(&mut out, *target_ip, &state.read())?;
+            }
+        }
+        std::io::Write::flush(&mut out)?;
+    }
+
+    Ok(())
+}
+
+/// Drain newly recorded probe events from each session and emit them as
+/// line-delimited JSON on stdout. Draining (rather than indexing) keeps
+/// memory bounded for long-running streams; nothing else consumes events
+/// in stream mode (--stream-json conflicts with batch --json export).
+fn emit_stream_events(sessions: &SessionMap, targets: &[IpAddr]) -> Result<()> {
+    let mut out = std::io::stdout().lock();
+    let mut wrote = false;
+    let sessions_read = sessions.read();
+    for target_ip in targets {
+        if let Some(state) = sessions_read.get(target_ip) {
+            let events: Vec<_> = {
+                let mut session = state.write();
+                if session.events.is_empty() {
+                    continue;
+                }
+                session.events.drain(..).collect()
+            };
+            for event in &events {
+                write_event_line(&mut out, *target_ip, event)?;
+            }
+            wrote = true;
+        }
+    }
+    if wrote {
+        std::io::Write::flush(&mut out)?;
+    }
     Ok(())
 }
 
