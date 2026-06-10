@@ -46,6 +46,8 @@ See [Installation](#installation) below for setup instructions.
 - **Update notifications** - in-app banner when new versions are available
 - **Scriptable** - JSON, CSV, text report, and line-delimited JSON streaming output
 - **Trace diffing** - compare two saved sessions for path and latency changes
+- **Daemon mode + Prometheus exporter** - headless continuous monitoring with `/metrics` and `/healthz`
+- **Docker-ready** - official Dockerfile, graceful SIGTERM shutdown
 
 See [docs/FEATURES.md](docs/FEATURES.md) for detailed documentation, including optional setup for [GeoIP](docs/FEATURES.md#geoip-location) and [IX detection](docs/FEATURES.md#ix-detection).
 
@@ -193,6 +195,7 @@ ttl 1.1.1.1 -c 100 --json      # JSON export
 ttl 1.1.1.1 -c 100 --csv       # CSV export
 ttl 1.1.1.1 --stream-json      # Stream events as line-delimited JSON
 ttl --diff before.json after.json    # Compare two saved sessions
+ttl --daemon --prometheus :9090 1.1.1.1   # Headless + Prometheus metrics
 ttl --replay results.json      # Replay saved session
 ttl --replay results.json --animate  # Animated replay
 ```

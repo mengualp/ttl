@@ -13,6 +13,7 @@ mod cli;
 mod config;
 mod export;
 mod lookup;
+mod metrics;
 mod prefs;
 mod probe;
 mod state;
@@ -322,7 +323,7 @@ async fn main() -> Result<()> {
             resolve_info,
         )
         .await
-    } else if args.no_tui || args.stream_json {
+    } else if args.is_headless() {
         run_streaming_mode(
             args,
             sessions,
@@ -1288,8 +1289,33 @@ async fn run_streaming_mode(
     // Spawn rate limit detection worker (always enabled, lightweight analysis)
     let ratelimit_handle = tokio::spawn(run_ratelimit_worker(sessions.clone(), cancel.clone()));
 
+    // Bind the Prometheus exporter up front so bind errors fail fast
+    let metrics_handle = if let Some(addr) = args.prometheus_addr() {
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("Failed to bind Prometheus exporter on {}", addr))?;
+        eprintln!(
+            "Prometheus exporter listening on http://{}/metrics",
+            listener.local_addr()?
+        );
+        Some(tokio::spawn(metrics::run_metrics_server(
+            listener,
+            sessions.clone(),
+            cancel.clone(),
+        )))
+    } else {
+        None
+    };
+
     // Print results as they come in
     let stream_json = args.stream_json;
+    let daemon = args.daemon;
+    if daemon && !stream_json && metrics_handle.is_none() {
+        eprintln!(
+            "Warning: --daemon without --prometheus or --stream-json produces no output; \
+             probing continues but results are not observable."
+        );
+    }
     let mut last_total_received: HashMap<IpAddr, u64> = HashMap::new();
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
 
@@ -1301,6 +1327,11 @@ async fn run_streaming_mode(
             _ = interval.tick() => {
                 if stream_json {
                     emit_stream_events(&sessions, &targets)?;
+                    continue;
+                }
+                if daemon {
+                    // Daemon mode: no per-hop stdout; data is consumed via
+                    // --prometheus or --stream-json
                     continue;
                 }
                 let sessions_read = sessions.read();
@@ -1373,6 +1404,12 @@ async fn run_streaming_mode(
     ratelimit_handle.await?;
     shutdown_log("streaming ratelimit worker joined");
 
+    if let Some(handle) = metrics_handle {
+        shutdown_log("streaming waiting for metrics server");
+        handle.await?;
+        shutdown_log("streaming metrics server joined");
+    }
+
     // Final drain: emit events recorded between loop exit and receiver join,
     // then a per-target summary line
     if stream_json {
@@ -1434,19 +1471,52 @@ fn generate_completions(shell: &str) {
     generate(shell, &mut cmd, "ttl", &mut std::io::stdout());
 }
 
+/// Install a handler that cancels on Ctrl+C (SIGINT) and, on unix, SIGTERM —
+/// the signal container runtimes send on `docker stop`.
 fn install_ctrlc_handler(cancel: CancellationToken) {
     tokio::spawn(async move {
+        #[cfg(unix)]
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+
         loop {
-            if tokio::signal::ctrl_c().await.is_err() {
-                break;
-            }
+            #[cfg(unix)]
+            let signal_name = {
+                let sigterm_recv = async {
+                    match sigterm.as_mut() {
+                        Some(s) => {
+                            s.recv().await;
+                        }
+                        None => std::future::pending().await,
+                    }
+                };
+                tokio::select! {
+                    result = tokio::signal::ctrl_c() => {
+                        if result.is_err() {
+                            break;
+                        }
+                        "Ctrl+C"
+                    }
+                    _ = sigterm_recv => "SIGTERM",
+                }
+            };
+            #[cfg(not(unix))]
+            let signal_name = {
+                if tokio::signal::ctrl_c().await.is_err() {
+                    break;
+                }
+                "Ctrl+C"
+            };
 
             if cancel.is_cancelled() {
-                eprintln!("Ctrl+C during shutdown, forcing exit.");
+                eprintln!("{} during shutdown, forcing exit.", signal_name);
                 std::process::exit(130);
             }
 
-            eprintln!("Ctrl+C received, shutting down (press Ctrl+C again to force exit).");
+            eprintln!(
+                "{} received, shutting down (repeat to force exit).",
+                signal_name
+            );
             cancel.cancel();
         }
     });

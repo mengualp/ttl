@@ -125,10 +125,10 @@
 
 **Why this matters:** Containerized infrastructure needs lightweight, headless traceroute for continuous path monitoring and integration with Prometheus/Grafana.
 
-- [ ] Official Dockerfile (minimal image, NET_RAW capability)
-- [ ] `--daemon` mode (no TUI, lightweight, signal handling)
-- [ ] Prometheus/OpenMetrics exporter (`--prometheus :9090`)
-- [ ] Health check endpoint for container orchestration
+- [x] Official Dockerfile (minimal image, NET_RAW capability)
+- [x] `--daemon` mode (no TUI, lightweight, SIGINT/SIGTERM handling)
+- [x] Prometheus/OpenMetrics exporter (`--prometheus :9090`)
+- [x] Health check endpoint for container orchestration (`/healthz`)
 
 ### Interactive Target Selection
 
