@@ -26,8 +26,8 @@ use crate::state::{ProbeEvent, Session};
 use crate::trace::receiver::SessionMap;
 use crate::tui::theme::Theme;
 use crate::tui::views::{
-    HelpView, HopDetailView, MainView, SettingsState, SettingsView, TargetInfo, TargetListView,
-    extract_target_infos,
+    AddTargetRequest, HelpView, HopDetailView, MainView, SettingsState, SettingsView, TargetInfo,
+    TargetInputState, TargetInputView, TargetListView, extract_target_infos,
 };
 
 /// State for animated replay playback
@@ -108,6 +108,10 @@ pub struct UiState {
     pub target_list_cache: Option<Vec<TargetInfo>>,
     /// Tick counter for target list cache refresh
     pub target_list_tick: u32,
+    /// Show target input modal
+    pub show_target_input: bool,
+    /// Target input modal state
+    pub target_input: TargetInputState,
 }
 
 impl UiState {
@@ -135,6 +139,7 @@ pub async fn run_tui(
     ix_lookup: Option<Arc<IxLookup>>,
     update_rx: Option<std::sync::mpsc::Receiver<Option<String>>>,
     replay_state: Option<ReplayState>,
+    add_target_tx: Option<tokio::sync::mpsc::UnboundedSender<AddTargetRequest>>,
 ) -> Result<Prefs> {
     // Setup terminal
     enable_raw_mode()?;
@@ -196,6 +201,7 @@ pub async fn run_tui(
         cancel.clone(),
         tick_rate,
         ix_lookup.clone(),
+        add_target_tx,
     )
     .await?;
 
@@ -469,21 +475,22 @@ fn adjust_replay_speed(ui_state: &mut UiState, delta: f32) {
     ui_state.set_status(format!("Speed: {:.1}x", new_speed));
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_app<B>(
     terminal: &mut Terminal<B>,
     sessions: SessionMap,
-    targets: Vec<IpAddr>,
+    mut targets: Vec<IpAddr>,
     ui_state: &mut UiState,
     cancel: CancellationToken,
     tick_rate: Duration,
     ix_lookup: Option<Arc<IxLookup>>,
+    add_target_tx: Option<tokio::sync::mpsc::UnboundedSender<AddTargetRequest>>,
 ) -> Result<()>
 where
     B: ratatui::backend::Backend,
     B::Error: Send + Sync + 'static,
 {
     let theme_names = Theme::list();
-    let num_targets = targets.len();
     let ix_enabled = ix_lookup.is_some();
 
     loop {
@@ -492,8 +499,14 @@ where
             break;
         }
 
+        // Targets can grow at runtime via the add-target modal
+        let num_targets = targets.len();
+
         // Clear old status messages
         ui_state.clear_old_status();
+
+        // Poll for a pending add-target result (non-blocking)
+        poll_add_target_result(ui_state, &mut targets);
 
         // Poll for update check result (non-blocking)
         // Drop receiver once we get any result (Some or None) or sender disconnects
@@ -519,39 +532,46 @@ where
             let adjusted_elapsed = replay_current_ms(replay);
 
             // Capture target before acquiring locks to prevent race condition
-            let target_ip = targets[ui_state.selected_target];
-
-            // Find all events up to current adjusted time
-            let start = replay.current_index;
-            let mut end = start;
-            while end < replay.events.len() && replay.events[end].offset_ms <= adjusted_elapsed {
-                end += 1;
-            }
-
-            // Apply all events in a single lock acquisition (no per-event lock churn)
-            if end > start {
-                let sessions_read = sessions.read();
-                if let Some(session_lock) = sessions_read.get(&target_ip) {
-                    let mut session = session_lock.write();
-                    for event in &replay.events[start..end] {
-                        session.apply_replay_event(event);
-                    }
+            // (replay mode always has exactly one target)
+            if let Some(target_ip) = targets.get(ui_state.selected_target).copied() {
+                // Find all events up to current adjusted time
+                let start = replay.current_index;
+                let mut end = start;
+                while end < replay.events.len() && replay.events[end].offset_ms <= adjusted_elapsed
+                {
+                    end += 1;
                 }
-                replay.current_index = end;
-            }
 
-            // Check if replay is complete
-            if replay.current_index >= replay.events.len() {
-                replay.finished = true;
-                ui_state.set_status("Replay complete");
+                // Apply all events in a single lock acquisition (no per-event lock churn)
+                if end > start {
+                    let sessions_read = sessions.read();
+                    if let Some(session_lock) = sessions_read.get(&target_ip) {
+                        let mut session = session_lock.write();
+                        for event in &replay.events[start..end] {
+                            session.apply_replay_event(event);
+                        }
+                    }
+                    replay.current_index = end;
+                }
+
+                // Check if replay is complete
+                if replay.current_index >= replay.events.len() {
+                    replay.finished = true;
+                    ui_state.set_status("Replay complete");
+                }
             }
         }
 
         // Get current theme
         let theme = Theme::by_name(theme_names[ui_state.theme_index]);
 
-        // Get current target's session
-        let current_target = targets[ui_state.selected_target];
+        // Get current target's session. With no targets yet (interactive empty
+        // mode) the unspecified sentinel never matches a session, so all
+        // session-dependent key handlers below no-op gracefully.
+        let current_target = targets
+            .get(ui_state.selected_target)
+            .copied()
+            .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
 
         // Get cache status for settings modal
         let cache_status = ix_lookup.as_ref().map(|ix| ix.get_cache_status());
@@ -590,6 +610,11 @@ where
                     ix_enabled,
                 );
             })?;
+        } else {
+            // No targets yet (interactive empty mode)
+            terminal.draw(|f| {
+                draw_empty_state(f, ui_state, &theme, cache_status.clone(), ix_enabled);
+            })?;
         }
 
         // Handle input with timeout
@@ -603,6 +628,11 @@ where
             // Handle overlays first
             if ui_state.show_help {
                 ui_state.show_help = false;
+                continue;
+            }
+
+            if ui_state.show_target_input {
+                handle_target_input_key(key.code, key.modifiers, ui_state, &add_target_tx);
                 continue;
             }
 
@@ -905,6 +935,13 @@ where
                     );
                     ui_state.show_settings = true;
                 }
+                // Open target input modal (live mode only)
+                KeyCode::Char('o')
+                    if ui_state.replay_state.is_none() && add_target_tx.is_some() =>
+                {
+                    ui_state.target_input = TargetInputState::default();
+                    ui_state.show_target_input = true;
+                }
                 // Open target list overlay (only in multi-target mode)
                 KeyCode::Char('l') if num_targets > 1 => {
                     ui_state.target_list_index = ui_state.selected_target;
@@ -1019,6 +1056,154 @@ where
     }
 
     Ok(())
+}
+
+/// Poll the pending add-target reply; on success the new target joins the
+/// rotation and becomes selected.
+fn poll_add_target_result(ui_state: &mut UiState, targets: &mut Vec<IpAddr>) {
+    let Some(rx) = ui_state.target_input.pending.as_mut() else {
+        return;
+    };
+    match rx.try_recv() {
+        Ok(Ok(added)) => {
+            ui_state.target_input = TargetInputState::default();
+            ui_state.show_target_input = false;
+            if !targets.contains(&added.ip) {
+                targets.push(added.ip);
+            }
+            if let Some(idx) = targets.iter().position(|t| *t == added.ip) {
+                ui_state.selected_target = idx;
+                ui_state.selected = None;
+            }
+            if added.existed {
+                ui_state.set_status(format!("Already tracing {} ({})", added.name, added.ip));
+            } else {
+                ui_state.set_status(format!("Added target {} ({})", added.name, added.ip));
+            }
+        }
+        Ok(Err(msg)) => {
+            ui_state.target_input.pending = None;
+            ui_state.target_input.resolving = false;
+            ui_state.target_input.error = Some(msg);
+        }
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+        Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+            ui_state.target_input.pending = None;
+            ui_state.target_input.resolving = false;
+            ui_state.target_input.error = Some("Target manager unavailable".to_string());
+        }
+    }
+}
+
+/// Key handling for the target input modal
+fn handle_target_input_key(
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    ui_state: &mut UiState,
+    add_target_tx: &Option<tokio::sync::mpsc::UnboundedSender<AddTargetRequest>>,
+) {
+    match code {
+        KeyCode::Esc => {
+            ui_state.target_input = TargetInputState::default();
+            ui_state.show_target_input = false;
+        }
+        KeyCode::Enter => {
+            let host = ui_state.target_input.input.trim().to_string();
+            if host.is_empty() || ui_state.target_input.resolving {
+                return;
+            }
+            let Some(tx) = add_target_tx else { return };
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            if tx
+                .send(AddTargetRequest {
+                    host,
+                    reply: reply_tx,
+                })
+                .is_ok()
+            {
+                ui_state.target_input.pending = Some(reply_rx);
+                ui_state.target_input.resolving = true;
+                ui_state.target_input.error = None;
+            } else {
+                ui_state.target_input.error = Some("Target manager unavailable".to_string());
+            }
+        }
+        KeyCode::Backspace => ui_state.target_input.handle_backspace(),
+        KeyCode::Delete => ui_state.target_input.handle_delete(),
+        KeyCode::Left => ui_state.target_input.move_cursor_left(),
+        KeyCode::Right => ui_state.target_input.move_cursor_right(),
+        KeyCode::Char(c) if !modifiers.contains(KeyModifiers::CONTROL) => {
+            ui_state.target_input.handle_char(c);
+        }
+        _ => {}
+    }
+}
+
+/// Draw the empty state shown when no targets are being traced yet
+fn draw_empty_state(
+    f: &mut ratatui::Frame,
+    ui_state: &UiState,
+    theme: &Theme,
+    cache_status: Option<crate::lookup::ix::CacheStatus>,
+    ix_enabled: bool,
+) {
+    let area = f.area();
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(area);
+
+    let lines = vec![
+        ratatui::text::Line::default(),
+        ratatui::text::Line::styled(
+            format!("ttl v{}", env!("CARGO_PKG_VERSION")),
+            Style::default().fg(theme.header),
+        ),
+        ratatui::text::Line::default(),
+        ratatui::text::Line::styled("No targets yet", Style::default().fg(theme.text_dim)),
+        ratatui::text::Line::default(),
+        ratatui::text::Line::styled("Press 'o' to add a target", Style::default().fg(theme.text)),
+    ];
+    let empty = Paragraph::new(lines).alignment(ratatui::layout::Alignment::Center);
+    f.render_widget(empty, chunks[0]);
+
+    let (status_text, status_style): (Cow<'_, str>, Style) =
+        if let Some((ref msg, _)) = ui_state.status_message {
+            (
+                Cow::Borrowed(msg.as_str()),
+                Style::default().fg(theme.text_dim),
+            )
+        } else {
+            (
+                Cow::Borrowed("q quit | o add target | t theme | s settings | ? help"),
+                Style::default().fg(theme.text_dim),
+            )
+        };
+    f.render_widget(
+        Paragraph::new(status_text.as_ref()).style(status_style),
+        chunks[1],
+    );
+
+    // Overlays available in empty mode
+    if ui_state.show_help {
+        f.render_widget(HelpView::new(theme).with_replay(false), area);
+    }
+    if ui_state.show_settings {
+        let theme_names = Theme::list();
+        f.render_widget(
+            SettingsView::new(
+                theme,
+                &ui_state.settings,
+                theme_names,
+                cache_status,
+                ix_enabled,
+            ),
+            area,
+        );
+    }
+    if ui_state.show_target_input {
+        f.render_widget(TargetInputView::new(theme, &ui_state.target_input), area);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1154,14 +1339,14 @@ fn draw_ui(
     } else if num_targets > 1 {
         (
             Cow::Borrowed(
-                "q quit | Tab next | l list | p pause | r reset | t theme | w display | s settings | e export | ? help",
+                "q quit | Tab next | l list | o add | p pause | r reset | t theme | w display | s settings | e export | ? help",
             ),
             Style::default().fg(theme.text_dim),
         )
     } else {
         (
             Cow::Borrowed(
-                "q quit | p pause | r reset | t theme | w display | s settings | e export | ? help",
+                "q quit | o add | p pause | r reset | t theme | w display | s settings | e export | ? help",
             ),
             Style::default().fg(theme.text_dim),
         )
@@ -1208,6 +1393,10 @@ fn draw_ui(
             TargetListView::new(theme, infos, ui_state.target_list_index),
             area,
         );
+    }
+
+    if ui_state.show_target_input {
+        f.render_widget(TargetInputView::new(theme, &ui_state.target_input), area);
     }
 }
 

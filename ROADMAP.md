@@ -134,12 +134,12 @@
 
 **Why this matters:** Power users want to add and manage targets without restarting. This makes ttl a persistent network investigation tool.
 
-- [ ] `ttl` with no args enters interactive mode
-- [ ] Press `o` to open target input modal
-- [ ] Text input with hostname/IP validation
-- [ ] DNS resolution with loading state
-- [ ] Add additional targets mid-session
-- [ ] Empty state UI: "Press 'o' to add target"
+- [x] `ttl` with no args enters interactive mode
+- [x] Press `o` to open target input modal
+- [x] Text input with hostname/IP validation
+- [x] DNS resolution with loading state
+- [x] Add additional targets mid-session
+- [x] Empty state UI: "Press 'o' to add target"
 
 ---
 

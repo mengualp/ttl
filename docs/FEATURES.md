@@ -86,6 +86,22 @@ ttl automatically detects NAT devices that rewrite source ports:
 - Displays "NAT" indicator in hop details when mismatch detected
 - Useful for diagnosing carrier-grade NAT (CGNAT) or enterprise NAT
 
+## Interactive Target Selection
+
+```bash
+ttl              # Start with an empty session
+```
+
+Run `ttl` with no arguments to open an empty interactive session, then press
+`o` to add targets. The input modal resolves hostnames in the background
+(showing a "Resolving..." state) and starts probing immediately on success —
+no restart needed. Targets can also be added mid-session in any live TUI run;
+entering a host that's already being traced switches to it.
+
+Probe infrastructure scales at runtime: each added target gets its own probe
+engine, and a packet receiver is started for an IP family the first time a
+target of that family is added.
+
 ## Multi-IP Resolution
 
 ```bash
@@ -386,6 +402,7 @@ High jitter indicates path instability from congestion, route changes, or load b
 | `s` | Open settings modal |
 | `e` | Export current session to JSON |
 | `?` / `h` | Show help dialog |
+| `o` | Add a target (works mid-session and from the empty state) |
 | `Tab` / `n` | Switch to next target |
 | `Shift-Tab` / `N` | Switch to previous target |
 | `l` | Open target list (multi-target mode) |

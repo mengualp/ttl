@@ -318,6 +318,7 @@ When a hostname resolves to multiple IPs (round-robin DNS, CDN load balancing), 
 | `e` | Export JSON |
 | `?` | Help |
 | `u` | Dismiss update banner |
+| `o` | Add target |
 | `Tab` | Next target |
 | `l` | Target list |
 | `Enter` | Expand hop |
