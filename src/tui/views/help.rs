@@ -88,6 +88,10 @@ impl Widget for HelpView<'_> {
             ]),
             Line::from(""),
             Line::from(vec![
+                Span::styled("  o       ", Style::default().fg(self.theme.shortcut)),
+                Span::raw("Add target"),
+            ]),
+            Line::from(vec![
                 Span::styled("  Tab/n   ", Style::default().fg(self.theme.shortcut)),
                 Span::raw("Next target (multi-target)"),
             ]),

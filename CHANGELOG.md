@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Interactive target selection**: run `ttl` with no arguments to open an empty session, then press `o` to add targets — also works mid-session in any live TUI run. Hostnames resolve in the background with a loading state; probe engines (and receivers, for a new IP family) spawn at runtime. Entering an already-traced host switches to it.
 - **Daemon mode** (`--daemon`): headless probing with no per-hop stdout, for container/monitoring deployments. Combine with `--prometheus` and/or `--stream-json` to consume the data.
 - **Prometheus exporter** (`--prometheus <ADDR>`, e.g. `:9090`): OpenMetrics endpoint with per-hop sent/response/timeout counters, RTT avg/min/max/stddev gauges, loss ratio, ECMP responder count, hop identity info series, and per-target reachability/path-length metrics. Includes `GET /healthz` for container orchestration. Hand-rolled over the existing tokio runtime — no new dependencies.
 - **SIGTERM handling**: `docker stop` now triggers the same graceful shutdown as Ctrl-C (unix).

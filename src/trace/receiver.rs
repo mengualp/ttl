@@ -73,8 +73,6 @@ pub struct Receiver {
     cancel: CancellationToken,
     config: ReceiverConfig,
     consecutive_errors: u32,
-    /// List of target IPs for probe lookup (cached from sessions keys)
-    targets: Vec<IpAddr>,
 }
 
 impl Receiver {
@@ -84,15 +82,12 @@ impl Receiver {
         cancel: CancellationToken,
         config: ReceiverConfig,
     ) -> Self {
-        // Cache target list for probe lookup
-        let targets: Vec<IpAddr> = sessions.read().keys().cloned().collect();
         Self {
             sessions,
             pending,
             cancel,
             config,
             consecutive_errors: 0,
-            targets,
         }
     }
 
@@ -201,6 +196,12 @@ impl Receiver {
                             // Find matching pending probe (key includes flow_id, target, is_pmtud)
                             let mut found_probe = None;
                             {
+                                // Read live target list before taking the pending lock
+                                // (targets can be added mid-session in interactive mode;
+                                // sessions lock is never acquired while pending is held)
+                                let fallback_targets: Vec<IpAddr> =
+                                    self.sessions.read().keys().copied().collect();
+
                                 let mut pending = self.pending.write();
 
                                 // If we have original_dest from ICMP error, use direct lookup
@@ -215,7 +216,7 @@ impl Receiver {
 
                                 // Fallback: iterate targets (for Echo Reply which has no quoted dest)
                                 if found_probe.is_none() {
-                                    for target in &self.targets {
+                                    for target in &fallback_targets {
                                         if let Some(probe) = Self::remove_pending_by_flow_hint(
                                             &mut pending,
                                             parsed.probe_id,

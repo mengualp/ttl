@@ -10,6 +10,7 @@ EXAMPLES:
     Basic tracing:
         ttl 8.8.8.8
         ttl google.com cloudflare.com    # Multiple targets
+        ttl                              # Empty session; press 'o' to add targets
 
     Protocol selection:
         ttl -p udp google.com            # UDP probes
@@ -47,8 +48,8 @@ DETECTION INDICATORS:
 For detailed documentation: https://github.com/lance0/ttl/blob/master/docs/FEATURES.md
 ")]
 pub struct Args {
-    /// Target hosts to trace (IP address or hostname)
-    #[arg(required_unless_present_any = ["completions", "replay", "diff"])]
+    /// Target hosts to trace (IP address or hostname).
+    /// With no targets, opens an interactive empty session (press 'o' to add).
     pub targets: Vec<String>,
 
     /// Number of probe rounds (0 = infinite). Each round sends probes to all TTLs.
@@ -245,6 +246,12 @@ impl Args {
 
     /// Validate arguments
     pub fn validate(&self) -> Result<(), String> {
+        // Interactive TUI mode supports starting empty (add targets with 'o');
+        // every other mode needs at least one target up front
+        if self.targets.is_empty() && (self.is_batch_mode() || self.is_headless()) {
+            return Err("No targets specified (required for non-interactive modes)".into());
+        }
+
         if self.is_batch_mode() && self.count == 0 {
             return Err("Batch output modes (--json, --csv, --report) require -c to be set".into());
         }
@@ -478,6 +485,46 @@ mod tests {
         assert!(Args::try_parse_from(["ttl", "--stream-json", "--json", "8.8.8.8"]).is_err());
         assert!(Args::try_parse_from(["ttl", "--stream-json", "--csv", "8.8.8.8"]).is_err());
         assert!(Args::try_parse_from(["ttl", "--stream-json", "--report", "8.8.8.8"]).is_err());
+    }
+
+    #[test]
+    fn test_empty_targets_interactive_ok() {
+        let args = make_args(|a| a.targets = vec![]);
+        assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn test_empty_targets_rejected_for_non_interactive_modes() {
+        let no_tui = make_args(|a| {
+            a.targets = vec![];
+            a.no_tui = true;
+        });
+        assert!(no_tui.validate().unwrap_err().contains("No targets"));
+
+        let batch = make_args(|a| {
+            a.targets = vec![];
+            a.json = true;
+            a.count = 5;
+        });
+        assert!(batch.validate().is_err());
+
+        let daemon = make_args(|a| {
+            a.targets = vec![];
+            a.daemon = true;
+        });
+        assert!(daemon.validate().is_err());
+
+        let stream = make_args(|a| {
+            a.targets = vec![];
+            a.stream_json = true;
+        });
+        assert!(stream.validate().is_err());
+
+        let prom = make_args(|a| {
+            a.targets = vec![];
+            a.prometheus = Some(":9090".to_string());
+        });
+        assert!(prom.validate().is_err());
     }
 
     #[test]

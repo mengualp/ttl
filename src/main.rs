@@ -41,6 +41,7 @@ use trace::engine::ProbeEngine;
 use trace::pending::{PendingMap, new_pending_map};
 use trace::receiver::{ReceiverConfig, SessionMap, spawn_receiver};
 use tui::app::{ReplayState, ResolveInfo, run_tui};
+use tui::views::target_input::{AddTargetRequest, AddedTarget};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -204,7 +205,9 @@ async fn main() -> Result<()> {
         None
     };
 
-    if targets.is_empty() {
+    // Empty args.targets means interactive empty mode (add targets with 'o');
+    // headless/batch modes without targets are rejected by args.validate().
+    if targets.is_empty() && !args.targets.is_empty() {
         anyhow::bail!("No valid targets specified");
     }
 
@@ -259,8 +262,11 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Validate source IP matches target IP family
-    if let Some(source_ip) = config.source_ip {
+    // Validate source IP matches target IP family (with no initial targets,
+    // the family check happens when each target is added)
+    if let Some(source_ip) = config.source_ip
+        && !targets.is_empty()
+    {
         if mixed {
             eprintln!(
                 "Error: --source-ip cannot be used with mixed IPv4/IPv6 targets. \
@@ -517,6 +523,7 @@ async fn run_replay_mode(args: &Args, replay_path: &str) -> Result<()> {
             None,
             None,
             replay_state,
+            None, // add_target_tx (replay mode has no live probing)
         )
         .await?;
 
@@ -897,6 +904,32 @@ async fn run_interactive_mode(
     // Spawn rate limit detection worker (always enabled, lightweight analysis)
     let ratelimit_handle = tokio::spawn(run_ratelimit_worker(sessions.clone(), cancel.clone()));
 
+    // Spawn the target manager: resolves and starts probing targets added
+    // at runtime via the TUI's 'o' modal
+    let (add_target_tx, add_target_rx) = tokio::sync::mpsc::unbounded_channel();
+    let manager_handle = {
+        let has_v4_receiver = targets.iter().any(|t| t.is_ipv4());
+        let has_v6_receiver = targets.iter().any(|t| t.is_ipv6());
+        let effective_flows_v4 = has_v4_receiver
+            .then(|| session_effective_flows_for_family(&sessions, &targets, false, config.flows));
+        let effective_flows_v6 = has_v6_receiver
+            .then(|| session_effective_flows_for_family(&sessions, &targets, true, config.flows));
+        tokio::spawn(run_target_manager(TargetManagerCtx {
+            rx: add_target_rx,
+            sessions: sessions.clone(),
+            pending: pending.clone(),
+            cancel: cancel.clone(),
+            interface: interface.clone(),
+            config: config.clone(),
+            force_ipv4: args.ipv4,
+            force_ipv6: args.ipv6,
+            has_v4_receiver,
+            has_v6_receiver,
+            effective_flows_v4,
+            effective_flows_v6,
+        }))
+    };
+
     // Run TUI (with target list for cycling)
     // Pass update_rx directly — TUI polls it non-blocking each tick
     let final_prefs = run_tui(
@@ -908,6 +941,7 @@ async fn run_interactive_mode(
         ix_lookup.clone(),
         Some(update_rx),
         None, // replay_state (live mode)
+        Some(add_target_tx),
     )
     .await?;
 
@@ -926,6 +960,9 @@ async fn run_interactive_mode(
     shutdown_log("interactive joining receiver threads");
     join_receivers(receiver_handles)?;
     shutdown_log("interactive receiver threads joined");
+    shutdown_log("interactive waiting for target manager");
+    manager_handle.await??;
+    shutdown_log("interactive target manager joined");
     if let Some(handle) = dns_handle {
         shutdown_log("interactive waiting for dns worker");
         handle.await?;
@@ -949,6 +986,186 @@ async fn run_interactive_mode(
     shutdown_log("interactive waiting for ratelimit worker");
     ratelimit_handle.await?;
     shutdown_log("interactive ratelimit worker joined");
+
+    Ok(())
+}
+
+/// Everything the target manager needs to start probing a new target
+struct TargetManagerCtx {
+    rx: tokio::sync::mpsc::UnboundedReceiver<AddTargetRequest>,
+    sessions: SessionMap,
+    pending: PendingMap,
+    cancel: CancellationToken,
+    interface: Option<InterfaceInfo>,
+    config: Config,
+    force_ipv4: bool,
+    force_ipv6: bool,
+    has_v4_receiver: bool,
+    has_v6_receiver: bool,
+    effective_flows_v4: Option<u8>,
+    effective_flows_v6: Option<u8>,
+}
+
+/// Handle add-target requests from the TUI: resolve the host, create the
+/// session, spawn its probe engine, and spawn a receiver if the IP family
+/// is new. Owns the handles it spawns and joins them after cancellation.
+async fn run_target_manager(mut ctx: TargetManagerCtx) -> Result<()> {
+    let mut engine_handles = Vec::new();
+    let mut receiver_handles = Vec::new();
+
+    loop {
+        let request = tokio::select! {
+            _ = ctx.cancel.cancelled() => break,
+            req = ctx.rx.recv() => match req {
+                Some(r) => r,
+                None => break,
+            },
+        };
+
+        let host = request.host.clone();
+        let (force_v4, force_v6) = (ctx.force_ipv4, ctx.force_ipv6);
+        let resolved =
+            tokio::task::spawn_blocking(move || resolve_target(&host, force_v4, force_v6)).await;
+        let ip = match resolved {
+            Ok(Ok(ip)) => ip,
+            Ok(Err(e)) => {
+                let _ = request.reply.send(Err(format!("{:#}", e)));
+                continue;
+            }
+            Err(e) => {
+                let _ = request
+                    .reply
+                    .send(Err(format!("Resolver task failed: {}", e)));
+                continue;
+            }
+        };
+
+        if ctx.sessions.read().contains_key(&ip) {
+            let _ = request.reply.send(Ok(AddedTarget {
+                ip,
+                name: request.host,
+                existed: true,
+            }));
+            continue;
+        }
+
+        let ipv6 = ip.is_ipv6();
+
+        // Family constraints validated at startup for initial targets
+        if let Some(source_ip) = ctx.config.source_ip
+            && source_ip.is_ipv6() != ipv6
+        {
+            let _ = request.reply.send(Err(format!(
+                "--source-ip {} does not match target family",
+                source_ip
+            )));
+            continue;
+        }
+        if let Some(ref info) = ctx.interface {
+            if ipv6 && info.ipv6.is_none() {
+                let _ = request.reply.send(Err(format!(
+                    "Interface '{}' has no IPv6 address",
+                    info.name
+                )));
+                continue;
+            }
+            if !ipv6 && info.ipv4.is_none() {
+                let _ = request.reply.send(Err(format!(
+                    "Interface '{}' has no IPv4 address",
+                    info.name
+                )));
+                continue;
+            }
+        }
+
+        // Per-target config with effective flow capability for its family
+        let mut flows_v4 = ctx.effective_flows_v4;
+        let mut flows_v6 = ctx.effective_flows_v6;
+        let target_config = config_for_target_effective_flows(
+            &ctx.config,
+            ip,
+            ctx.interface.as_ref(),
+            &mut flows_v4,
+            &mut flows_v6,
+        );
+        ctx.effective_flows_v4 = flows_v4;
+        ctx.effective_flows_v6 = flows_v6;
+
+        let target = Target::new(request.host.clone(), ip);
+        let mut session = Session::new(target, target_config);
+        session.source_ip = ctx.config.source_ip.or_else(|| {
+            let addr = get_local_addr_with_interface(ip, ctx.interface.as_ref());
+            if addr.is_unspecified() {
+                None
+            } else {
+                Some(addr)
+            }
+        });
+        session.gateway = if let Some(ref info) = ctx.interface {
+            if ipv6 {
+                info.gateway_ipv6.map(IpAddr::V6)
+            } else {
+                info.gateway_ipv4.map(IpAddr::V4)
+            }
+        } else {
+            detect_default_gateway(ipv6)
+        };
+
+        let state = Arc::new(RwLock::new(session));
+        ctx.sessions.write().insert(ip, state.clone());
+
+        // Spawn a receiver if this IP family doesn't have one yet
+        let family_has_receiver = if ipv6 {
+            &mut ctx.has_v6_receiver
+        } else {
+            &mut ctx.has_v4_receiver
+        };
+        if !*family_has_receiver {
+            let num_flows = if ipv6 { flows_v6 } else { flows_v4 }.unwrap_or(1);
+            let receiver_config = ReceiverConfig {
+                timeout: ctx.config.timeout,
+                ipv6,
+                src_port_base: ctx.config.src_port_base,
+                num_flows,
+                interface: ctx.interface.clone(),
+                recv_any: ctx.config.recv_any,
+            };
+            receiver_handles.push(spawn_receiver(
+                ctx.sessions.clone(),
+                ctx.pending.clone(),
+                ctx.cancel.clone(),
+                receiver_config,
+            ));
+            *family_has_receiver = true;
+        }
+
+        // Spawn the probe engine
+        let engine_config = state.read().config.clone();
+        let engine = ProbeEngine::new(
+            engine_config,
+            ip,
+            state.clone(),
+            ctx.pending.clone(),
+            ctx.cancel.clone(),
+            ctx.interface.clone(),
+        );
+        engine_handles.push(tokio::spawn(async move { engine.run().await }));
+
+        let _ = request.reply.send(Ok(AddedTarget {
+            ip,
+            name: request.host,
+            existed: false,
+        }));
+    }
+
+    // Join everything this task spawned (cancellation already requested)
+    shutdown_log("target manager waiting for its probe engines");
+    for handle in engine_handles {
+        handle.await??;
+    }
+    shutdown_log("target manager joining its receiver threads");
+    tokio::task::spawn_blocking(move || join_receivers(receiver_handles)).await??;
+    shutdown_log("target manager receivers joined");
 
     Ok(())
 }
