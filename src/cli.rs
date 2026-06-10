@@ -31,6 +31,9 @@ EXAMPLES:
         ttl --stream-json host | jq .   # Line-delimited JSON events
         ttl --diff before.json after.json
 
+    Continuous monitoring:
+        ttl --daemon --prometheus :9090 host   # Headless + metrics endpoint
+
 DETECTION INDICATORS:
     [NAT]  - Source port rewriting detected (affects multi-flow accuracy)
     [RL?]  - Router rate-limiting ICMP (loss may be artificial)
@@ -152,6 +155,14 @@ pub struct Args {
     #[arg(long = "stream-json", conflicts_with_all = ["json", "csv", "report", "replay", "diff"])]
     pub stream_json: bool,
 
+    /// Daemon mode: headless, no per-hop output (combine with --prometheus or --stream-json)
+    #[arg(long = "daemon", conflicts_with_all = ["json", "csv", "report", "replay", "diff"])]
+    pub daemon: bool,
+
+    /// Serve Prometheus/OpenMetrics on this address (e.g. :9090 or 127.0.0.1:9090; implies --no-tui)
+    #[arg(long = "prometheus", value_name = "ADDR", conflicts_with_all = ["json", "csv", "report", "replay", "diff"])]
+    pub prometheus: Option<String>,
+
     /// Color theme (default, kawaii, cyber, dracula, monochrome, matrix, nord, gruvbox, catppuccin, tokyo_night, solarized)
     #[arg(long = "theme", default_value = "default")]
     pub theme: String,
@@ -214,6 +225,22 @@ impl Args {
     /// Check if running in batch mode (non-interactive)
     pub fn is_batch_mode(&self) -> bool {
         self.json || self.csv || self.report
+    }
+
+    /// Check if running headless (no TUI)
+    pub fn is_headless(&self) -> bool {
+        self.no_tui || self.stream_json || self.daemon || self.prometheus.is_some()
+    }
+
+    /// Parse the --prometheus listen address; ":9090" binds all interfaces
+    pub fn prometheus_addr(&self) -> Option<std::net::SocketAddr> {
+        let addr = self.prometheus.as_deref()?;
+        let full = if addr.starts_with(':') {
+            format!("0.0.0.0{}", addr)
+        } else {
+            addr.to_string()
+        };
+        full.parse().ok()
     }
 
     /// Validate arguments
@@ -291,6 +318,16 @@ impl Args {
             return Err("Replay speed must be between 0.1 and 1000.0".into());
         }
 
+        // Validate prometheus listen address early (":9090" means all interfaces)
+        if let Some(ref addr) = self.prometheus
+            && self.prometheus_addr().is_none()
+        {
+            return Err(format!(
+                "Invalid --prometheus address: {} (use :9090 or 127.0.0.1:9090)",
+                addr
+            ));
+        }
+
         // Validate interface name
         if let Some(ref iface) = self.interface {
             if iface.is_empty() {
@@ -339,6 +376,8 @@ mod tests {
             speed: 10.0,
             diff: None,
             stream_json: false,
+            daemon: false,
+            prometheus: None,
             theme: "default".to_string(),
             wide: false,
             interface: None,
@@ -439,5 +478,53 @@ mod tests {
         assert!(Args::try_parse_from(["ttl", "--stream-json", "--json", "8.8.8.8"]).is_err());
         assert!(Args::try_parse_from(["ttl", "--stream-json", "--csv", "8.8.8.8"]).is_err());
         assert!(Args::try_parse_from(["ttl", "--stream-json", "--report", "8.8.8.8"]).is_err());
+    }
+
+    #[test]
+    fn test_prometheus_addr_shorthand() {
+        let args = make_args(|a| a.prometheus = Some(":9090".to_string()));
+        assert_eq!(
+            args.prometheus_addr(),
+            Some("0.0.0.0:9090".parse().unwrap())
+        );
+        assert!(args.validate().is_ok());
+        assert!(args.is_headless());
+    }
+
+    #[test]
+    fn test_prometheus_addr_full() {
+        let args = make_args(|a| a.prometheus = Some("127.0.0.1:9100".to_string()));
+        assert_eq!(
+            args.prometheus_addr(),
+            Some("127.0.0.1:9100".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn test_prometheus_addr_invalid() {
+        let args = make_args(|a| a.prometheus = Some("not-an-addr".to_string()));
+        assert!(args.prometheus_addr().is_none());
+        assert!(args.validate().unwrap_err().contains("--prometheus"));
+    }
+
+    #[test]
+    fn test_daemon_conflicts_with_batch_output() {
+        assert!(Args::try_parse_from(["ttl", "--daemon", "--json", "8.8.8.8"]).is_err());
+        assert!(Args::try_parse_from(["ttl", "--daemon", "--replay", "x.json"]).is_err());
+    }
+
+    #[test]
+    fn test_daemon_composes_with_stream_json_and_prometheus() {
+        let args = Args::try_parse_from([
+            "ttl",
+            "--daemon",
+            "--stream-json",
+            "--prometheus",
+            ":9090",
+            "8.8.8.8",
+        ])
+        .unwrap();
+        assert!(args.daemon && args.stream_json);
+        assert!(args.is_headless());
     }
 }

@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Daemon mode** (`--daemon`): headless probing with no per-hop stdout, for container/monitoring deployments. Combine with `--prometheus` and/or `--stream-json` to consume the data.
+- **Prometheus exporter** (`--prometheus <ADDR>`, e.g. `:9090`): OpenMetrics endpoint with per-hop sent/response/timeout counters, RTT avg/min/max/stddev gauges, loss ratio, ECMP responder count, hop identity info series, and per-target reachability/path-length metrics. Includes `GET /healthz` for container orchestration. Hand-rolled over the existing tokio runtime — no new dependencies.
+- **SIGTERM handling**: `docker stop` now triggers the same graceful shutdown as Ctrl-C (unix).
+- **Official Dockerfile**: multi-stage Alpine/musl build producing a minimal image; `.dockerignore` included.
 - **Trace diffing** (`--diff before.json after.json`): compare two saved sessions hop by hop. Reports path changes (primary responder differs), added/lost hops, ECMP responder-set changes, avg RTT deltas (highlighted when ≥5ms and ≥20%), loss changes, and destination reachability. `--json` emits the diff as machine-readable JSON.
 - **Streaming JSON output** (`--stream-json`): emit each probe event (reply/timeout/late_reply) as one line of JSON on stdout for piping to jq/grep/monitoring pipelines. Event lines match the saved-session `events` schema with a `target` field added; a per-target `summary` line is emitted at end of stream. Implies `--no-tui`; memory stays bounded on infinite runs.
 

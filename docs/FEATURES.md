@@ -549,6 +549,61 @@ Summary: 1 path change(s), 0 hop(s) added, 1 hop(s) lost, 0 significant latency 
   destination reached in both (5 → 5 hops)
 ```
 
+### Daemon Mode & Prometheus Exporter
+
+```bash
+ttl --daemon --prometheus :9090 8.8.8.8      # Headless, metrics on :9090
+ttl --daemon --prometheus 127.0.0.1:9100 host1 host2
+ttl --daemon --stream-json host | jq .       # Daemon + event stream
+```
+
+`--daemon` runs headless with no per-hop stdout — probing continues until
+`-c` rounds complete or SIGINT/SIGTERM. Combine with `--prometheus` and/or
+`--stream-json` to consume the data. `docker stop` (SIGTERM) triggers the
+same graceful shutdown as Ctrl-C.
+
+`--prometheus <ADDR>` serves an OpenMetrics endpoint (`:9090` binds all
+interfaces). Endpoints:
+
+- `GET /metrics` — Prometheus exposition format
+- `GET /healthz` — returns `200 ok` for container orchestration
+
+Exported metrics (labels: `target` = resolved IP, `host` = name as given,
+`ttl` = hop number):
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `ttl_probes_sent_total` | counter | Probes sent per hop |
+| `ttl_responses_total` | counter | Responses received per hop |
+| `ttl_timeouts_total` | counter | Timeouts per hop |
+| `ttl_loss_ratio` | gauge | Loss ratio per hop (0–1) |
+| `ttl_rtt_avg_seconds` / `min` / `max` / `stddev` | gauge | RTT stats for the hop's primary responder |
+| `ttl_hop_responders` | gauge | Distinct responder IPs at the hop (ECMP) |
+| `ttl_hop_info` | gauge | Primary responder identity (`ip`, `hostname` labels, value 1) |
+| `ttl_target_reachable` | gauge | Destination responded (1/0) |
+| `ttl_path_hops` | gauge | Hop count to destination |
+| `ttl_target_probes_total` | counter | Completed probes across all hops |
+
+### Docker
+
+```bash
+docker build -t ttl .
+docker run --rm -it ttl 8.8.8.8                          # Interactive TUI
+docker run -d -p 9090:9090 ttl --daemon --prometheus :9090 8.8.8.8
+curl localhost:9090/metrics
+```
+
+The image is Alpine-based with a static musl binary. Docker grants
+`CAP_NET_RAW` by default; stricter runtimes (Kubernetes, podman) may need it
+added explicitly:
+
+```yaml
+# Kubernetes
+securityContext:
+  capabilities:
+    add: ["NET_RAW"]
+```
+
 ### Session Replay
 
 ```bash
@@ -617,6 +672,8 @@ Options:
       --json             JSON output (requires -c)
       --csv              CSV output (requires -c)
       --stream-json      Stream probe events as line-delimited JSON (implies --no-tui)
+      --daemon           Headless mode, no per-hop output (for --prometheus/--stream-json)
+      --prometheus <ADDR> Serve Prometheus metrics + /healthz (e.g. :9090; implies --no-tui)
       --diff <BEFORE> <AFTER>  Compare two saved sessions (with --json for JSON output)
       --replay <FILE>    Replay a saved JSON session
       --animate          Animate replay (show probe-by-probe discovery)

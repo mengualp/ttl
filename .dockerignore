@@ -1,0 +1,8 @@
+target/
+.git/
+.github/
+docs/
+tests/
+*.md
+.pre-commit-config.yaml
+install.sh
