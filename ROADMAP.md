@@ -156,7 +156,7 @@
 
 ### Medium Effort (moderate effort, high impact)
 - [ ] **PCAP export** — write probe/response packets to .pcap for Wireshark analysis
-- [ ] **IX lookup performance** — radix trie for O(prefix_len) instead of O(n) linear scan
+- [x] **IX lookup performance** — radix trie for O(prefix_len) instead of O(n) linear scan
 - [ ] **Customizable columns** — choose which stats to display in TUI
 - [x] **Container image** — pre-built multi-arch image on GHCR for CI/monitoring pipelines
 

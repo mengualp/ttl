@@ -17,6 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Trace diffing** (`--diff before.json after.json`): compare two saved sessions hop by hop. Reports path changes (primary responder differs), added/lost hops, ECMP responder-set changes, avg RTT deltas (highlighted when ≥5ms and ≥20%), loss changes, and destination reachability. `--json` emits the diff as machine-readable JSON.
 - **Streaming JSON output** (`--stream-json`): emit each probe event (reply/timeout/late_reply) as one line of JSON on stdout for piping to jq/grep/monitoring pipelines. Event lines match the saved-session `events` schema with a `target` field added; a per-target `summary` line is emitted at end of stream. Implies `--no-tui`; memory stays bounded on infinite runs.
 
+### Changed
+- **IX prefix lookup** now uses a binary radix trie instead of a linear scan: O(prefix_len) per responder IP (≤32/128 node hops) instead of O(n) over ~2,000 PeeringDB prefixes. No behavior change.
+
 ### Dependencies
 - maxminddb 0.27.3 → 0.28.1, getifs 0.4.0 → 0.6.1, tokio 1.52.1 → 1.52.3, serde_json 1.0.149 → 1.0.150, clap_complete 4.6.3 → 4.6.5
 
