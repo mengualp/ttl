@@ -134,6 +134,20 @@ sha256sum -c SHA256SUMS --ignore-missing  # macOS: shasum -a 256 -c
 tar xzf ttl-*.tar.gz && sudo mv ttl /usr/local/bin/
 ```
 
+### Docker
+
+Multi-arch images (amd64/arm64) are published to GHCR on each release:
+
+```bash
+docker pull ghcr.io/lance0/ttl:latest
+docker run --rm -it ghcr.io/lance0/ttl 8.8.8.8
+
+# Headless monitoring with Prometheus metrics
+docker run -d -p 9090:9090 ghcr.io/lance0/ttl --daemon --prometheus :9090 8.8.8.8
+```
+
+Docker grants the required `NET_RAW` capability by default; stricter runtimes may need `--cap-add NET_RAW`.
+
 ### From Source
 
 ```bash

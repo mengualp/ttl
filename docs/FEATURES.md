@@ -586,11 +586,19 @@ Exported metrics (labels: `target` = resolved IP, `host` = name as given,
 
 ### Docker
 
+Multi-arch images (amd64/arm64) are published to GHCR on each release:
+
+```bash
+docker pull ghcr.io/lance0/ttl:latest                    # or :0.20, :0.20.0
+docker run --rm -it ghcr.io/lance0/ttl 8.8.8.8           # Interactive TUI
+docker run -d -p 9090:9090 ghcr.io/lance0/ttl --daemon --prometheus :9090 8.8.8.8
+curl localhost:9090/metrics
+```
+
+Or build locally:
+
 ```bash
 docker build -t ttl .
-docker run --rm -it ttl 8.8.8.8                          # Interactive TUI
-docker run -d -p 9090:9090 ttl --daemon --prometheus :9090 8.8.8.8
-curl localhost:9090/metrics
 ```
 
 The image is Alpine-based with a static musl binary. Docker grants

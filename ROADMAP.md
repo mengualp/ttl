@@ -158,7 +158,7 @@
 - [ ] **PCAP export** — write probe/response packets to .pcap for Wireshark analysis
 - [ ] **IX lookup performance** — radix trie for O(prefix_len) instead of O(n) linear scan
 - [ ] **Customizable columns** — choose which stats to display in TUI
-- [ ] **Docker Hub image** — pre-built container for CI/monitoring pipelines
+- [x] **Container image** — pre-built multi-arch image on GHCR for CI/monitoring pipelines
 
 ### Larger Projects (high effort, high impact)
 - [ ] **ICMP checksum flow variation** — Paris traceroute for ICMP (vary checksum to create distinct flows). Neither ttl nor trippy implements this today. Requires platform-specific raw socket work (kernel checksum offloading on Linux, IP_HDRINCL). **Note:** Real-world value may be limited — Arista hardware flow-hashing platforms don't use ICMP checksum as entropy, so this approach won't create distinct flows on most switch hardware. TCP/UDP remain the reliable methods for multi-path detection. May still be useful on software load balancers.
@@ -262,7 +262,8 @@ See [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for documented edge cases and limitations
 - [x] Dependabot (Cargo + GitHub Actions)
 - [x] AUR package (`ttl-bin`, community-maintained)
 - [x] Gentoo package (`net-analyzer/ttl`, official repository)
-- [ ] Docker Hub image
+- [x] Container image on GHCR (`ghcr.io/lance0/ttl`, multi-arch, published on release)
+- [ ] Docker Hub mirror (optional — needs registry credentials; GHCR covers the use case)
 
 ---
 

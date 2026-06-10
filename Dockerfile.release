@@ -1,0 +1,12 @@
+# Used by the release workflow: packages prebuilt static musl binaries
+# (downloaded from the build matrix) into a minimal multi-arch image.
+# To build from source instead, use Dockerfile.
+FROM alpine:3.21
+ARG TARGETARCH
+RUN apk add --no-cache ca-certificates
+COPY bin/${TARGETARCH}/ttl /usr/local/bin/ttl
+
+# ttl needs CAP_NET_RAW for ICMP sockets. Docker grants NET_RAW by default;
+# stricter runtimes need: --cap-add NET_RAW
+ENTRYPOINT ["ttl"]
+CMD ["--help"]
