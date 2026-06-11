@@ -86,6 +86,17 @@
 - [x] CI: `cargo clippy --all-targets -- -D warnings` on Linux, macOS, and FreeBSD
 - [x] hickory-resolver 0.26 upgrade (closes RUSTSEC-2026-0118 and RUSTSEC-2026-0119)
 
+## Completed (v0.20.0)
+
+- [x] Trace diffing (`--diff before.json after.json`): added/lost hops, path changes, latency shifts; `--json` for machine-readable output
+- [x] Streaming JSON output (`--stream-json`): line-delimited probe events + per-target summary, composable with jq/grep
+- [x] Daemon mode (`--daemon`) with graceful SIGTERM shutdown (clean `docker stop`)
+- [x] Prometheus/OpenMetrics exporter (`--prometheus :9090`) with `/healthz` for orchestration
+- [x] Official Dockerfile + multi-arch (amd64/arm64) GHCR images (`ghcr.io/lance0/ttl`)
+- [x] Interactive target selection: `ttl` with no args opens an empty session; `o` adds targets mid-session with runtime engine/receiver spawning
+- [x] IX prefix lookup via binary radix trie (O(prefix_len) instead of O(n) linear scan)
+- [x] New `aarch64-unknown-linux-musl` release artifact
+
 ---
 
 ## Planned Features
@@ -110,36 +121,6 @@
 - [x] #46 acceptance: `E` (ECMP) and `!` (route flap) are no longer conflated in the same scenario
 - [ ] Paris strategy for UDP (`--strategy paris` — fixed 5-tuple, checksum encodes sequence) *(follow-on after #46 core fix)*
 - [ ] Dublin strategy for UDP (`--strategy dublin` — IP ID field encodes sequence) *(follow-on after #46 core fix)*
-
-### Trace Diffing & Streaming
-
-**Why this matters:** Users frequently need to compare traces taken at different times (before/after a change, during/after an incident). Streaming output enables integration with monitoring pipelines.
-
-- [x] Trace comparison (`ttl --diff trace1.json trace2.json`)
-- [x] Show added/removed/changed hops between two sessions
-- [x] Highlight latency and path changes
-- [x] Streaming JSON output (`--stream-json`) for piping to other tools
-- [x] Line-delimited JSON (one event per line, composable with jq/grep)
-
-### Docker & Daemon Mode
-
-**Why this matters:** Containerized infrastructure needs lightweight, headless traceroute for continuous path monitoring and integration with Prometheus/Grafana.
-
-- [x] Official Dockerfile (minimal image, NET_RAW capability)
-- [x] `--daemon` mode (no TUI, lightweight, SIGINT/SIGTERM handling)
-- [x] Prometheus/OpenMetrics exporter (`--prometheus :9090`)
-- [x] Health check endpoint for container orchestration (`/healthz`)
-
-### Interactive Target Selection
-
-**Why this matters:** Power users want to add and manage targets without restarting. This makes ttl a persistent network investigation tool.
-
-- [x] `ttl` with no args enters interactive mode
-- [x] Press `o` to open target input modal
-- [x] Text input with hostname/IP validation
-- [x] DNS resolution with loading state
-- [x] Add additional targets mid-session
-- [x] Empty state UI: "Press 'o' to add target"
 
 ---
 
