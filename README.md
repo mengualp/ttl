@@ -69,8 +69,10 @@ cargo install ttl
 ### Homebrew (macOS/Linux)
 
 ```bash
-brew install lance0/tap/ttl
+brew install ttl
 ```
+
+Available directly from [Homebrew core](https://formulae.brew.sh/formula/ttl). (The `lance0/tap/ttl` tap also still works and may ship new releases slightly sooner.)
 
 ### Alpine Linux
 

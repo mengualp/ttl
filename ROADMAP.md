@@ -238,7 +238,7 @@ See [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for documented edge cases and limitations
 
 - [x] GitHub Actions CI (build, test, clippy, FreeBSD)
 - [x] Binary releases (Linux x86_64/aarch64, macOS x86_64/aarch64)
-- [x] Homebrew formula (`brew install lance0/tap/ttl`)
+- [x] Homebrew core formula (`brew install ttl`) + `lance0/tap/ttl` tap
 - [x] Curl installer (`install.sh`)
 - [x] Dependabot (Cargo + GitHub Actions)
 - [x] AUR package (`ttl-bin`, community-maintained)
