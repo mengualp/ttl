@@ -101,6 +101,14 @@
 
 ## Planned Features
 
+### Before next release — TTL send-path correctness (follow-ups to #12)
+
+The macOS single-hop fix (#12) made the ICMP/UDP/TCP send paths use a fresh socket per probe, so the IP TTL can't be stamped from stale socket state by an asynchronous `sendto`. These items finish the job across platforms and retire the interim safety margin. **Targeted for completion before the next release.**
+
+- [ ] **Convert the FreeBSD/NetBSD raw send paths to per-probe sockets.** They still set `IP_TTL` on a shared raw socket per probe and rely only on the 500µs inter-probe delay — the same masking that proved insufficient on fast macOS. A fast BSD host could collapse to a single hop the same way. Low real-world incidence today (small user base, no report yet), but a known correctness gap.
+- [ ] **Drop the macOS arm of the 500µs `apply_rate_limit` delay.** Per-probe sockets are the deterministic fix on macOS, so the delay is now a redundant and slightly misleading safety net there. Remove it once the fix is confirmed on affected hardware; keep the delay only for any platform still on the shared-socket pattern until it is converted.
+- [ ] **Unify the send path on `IP_HDRINCL` (TTL written into a hand-built IP header).** Setting the TTL in the IP header on a raw socket, instead of `setsockopt(IP_TTL)` before an asynchronous send, removes the stale-TTL race *by construction* and uniformly across every platform. This **subsumes the two items above**: done well it eliminates the need for both per-probe sockets and the inter-probe delay everywhere. Requires raw IP-header construction with the BSD host-byte-order handling for `ip_len`/`ip_off`. Bigger lift, but the clean end state — do this **or** the two incremental items above, not both.
+
 ### Next — ECMP Improvements
 
 **Why this matters:** Per-packet load balancing (common on Arista, Juniper, Cisco) is undercounted by the current flow-primary model. Users see 8 responders in the detail view but "Paths: 1" in the main table. Related: #46
