@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.20.1] - 2026-06-27
 
 ### Fixed
 - **Traces no longer collapse to a single hop on macOS and other fast hosts** (#12). `sendto` is asynchronous on macOS/BSD: the kernel stamps each queued datagram with the socket's *current* IP TTL at drain time, so a rapid `setsockopt(IP_TTL); send` loop could emit every probe with the final TTL, leaving only the destination/gateway visible — intermittently, and more often on fast Apple Silicon (reproduced on the wire on an M2, macOS 26.5.1). The previous fixed 500µs delay only masked the race.
@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **IPv6:** each probe is sent from a fresh socket on the BSD-derived platforms (macOS, FreeBSD, NetBSD) — there is no IPv4-style `IP_HDRINCL` for IPv6 — gated by the `per_probe_send` cfg. Linux reuses one shared socket (its `sendto` never exhibited the race).
   - **The interim 500µs inter-probe delay has been removed.** The rapid probe sweeps are now race-free (IPv4 via `IP_HDRINCL`, IPv6 via per-probe sockets on all BSD-derived platforms), so the timing stopgap is no longer needed. The only remaining shared-socket send is the single IPv6 PMTUD probe per round, which is an isolated send (not a back-to-back burst) and so is unaffected.
   - Correlation is unaffected — the receiver matches on the probe sequence / payload-embedded identifier. IPv4 Path MTU Discovery now also works on NetBSD, since the Don't Fragment bit is set in the hand-built header rather than via the unavailable `IP_DONTFRAG` socket option.
+
+### Dependencies
+- `quinn-proto` 0.11.14 → 0.11.15, clearing RUSTSEC-2026-0185. The advisory affects a transitive dependency (reqwest's unused HTTP/3 feature) that ttl never compiles into the binary, so it was not reachable at runtime; the bump keeps `cargo audit` clean.
+- socket2 0.6.3 → 0.6.4, reqwest 0.13.3 → 0.13.4, ratatui 0.30.0 → 0.30.2, chrono 0.4.44 → 0.4.45 (patch updates).
 
 ## [0.20.0] - 2026-06-10
 
