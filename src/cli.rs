@@ -223,6 +223,19 @@ impl Args {
         Duration::from_secs_f64(self.timeout)
     }
 
+    fn validate_duration_arg(name: &str, value: f64) -> Result<(), String> {
+        if !value.is_finite() || value <= 0.0 {
+            return Err(format!("{name} must be a positive, finite number"));
+        }
+        Duration::try_from_secs_f64(value)
+            .map(|_| ())
+            .map_err(|_| format!("{name} is too large to represent as a duration"))
+    }
+
+    fn default_destination_port(protocol: &str) -> u16 {
+        if protocol == "tcp" { 80 } else { 33434 }
+    }
+
     /// Check if running in batch mode (non-interactive)
     pub fn is_batch_mode(&self) -> bool {
         self.json || self.csv || self.report
@@ -268,13 +281,8 @@ impl Args {
             ));
         }
 
-        if self.interval <= 0.0 {
-            return Err("Interval must be positive".into());
-        }
-
-        if self.timeout <= 0.0 {
-            return Err("Timeout must be positive".into());
-        }
+        Self::validate_duration_arg("Interval", self.interval)?;
+        Self::validate_duration_arg("Timeout", self.timeout)?;
 
         if self.max_ttl == 0 {
             return Err("Max TTL must be at least 1".into());
@@ -303,17 +311,35 @@ impl Args {
         let max_port = self.src_port as u32 + (self.flows as u32 - 1);
         if max_port > u16::MAX as u32 {
             return Err(format!(
-                "src_port ({}) + flows ({}) would use port {} (max 65535)",
-                self.src_port, self.flows, max_port
+                "src_port ({}) + flows - 1 ({}) would use port {} (max 65535)",
+                self.src_port,
+                self.flows - 1,
+                max_port
             ));
+        }
+        // Validate destination port + max_ttl doesn't overflow u16 (UDP/TCP modes)
+        // The engine sends probes to ports base_port..base_port+max_ttl (unless --fixed-port)
+        let uses_port = matches!(protocol.as_str(), "udp" | "tcp")
+            || (protocol == "auto" && self.port.is_some());
+        if uses_port && !self.port_fixed {
+            let default_port = Self::default_destination_port(&protocol);
+            let base = self.port.unwrap_or(default_port) as u32;
+            let max_dst_port = base + self.max_ttl as u32;
+            if max_dst_port > u16::MAX as u32 {
+                return Err(format!(
+                    "port ({}) + max-ttl ({}) would use port {} (max 65535); use --fixed-port or lower --port",
+                    base, self.max_ttl, max_dst_port
+                ));
+            }
         }
 
         // Validate timeout vs interval to prevent probe sequence wrap
-        // ProbeId.seq is u8 (0-255), so sequence wraps every 256 intervals
-        // If timeout > 256 * interval, old probes may still be pending when seq wraps
-        if self.timeout > 256.0 * self.interval {
+        // ProbeId.seq is u8 (0-255), so sequence wraps every 256 intervals.
+        // Use >= so the exact boundary is also rejected — at timeout == 256 * interval
+        // the oldest probes expire at the precise moment the sequence wraps, risking collision.
+        if self.timeout >= 256.0 * self.interval {
             return Err(format!(
-                "Timeout ({:.1}s) cannot exceed 256 × interval ({:.1}s = {:.1}s) to prevent sequence wrap",
+                "Timeout ({:.1}s) must be less than 256 × interval ({:.1}s = {:.1}s) to prevent sequence wrap",
                 self.timeout,
                 self.interval,
                 256.0 * self.interval
@@ -326,23 +352,34 @@ impl Args {
         }
 
         // Validate prometheus listen address early (":9090" means all interfaces)
-        if let Some(ref addr) = self.prometheus
+        if let Some(addr) = &self.prometheus
             && self.prometheus_addr().is_none()
         {
             return Err(format!(
-                "Invalid --prometheus address: {} (use :9090 or 127.0.0.1:9090)",
-                addr
+                "Invalid --prometheus address: {addr} (use :9090 or 127.0.0.1:9090)"
             ));
         }
 
         // Validate interface name
-        if let Some(ref iface) = self.interface {
+        if let Some(iface) = &self.interface {
             if iface.is_empty() {
                 return Err("Interface name cannot be empty".into());
             }
             // IFNAMSIZ on Linux is 16 including null terminator
             if iface.len() > 15 {
-                return Err(format!("Interface name too long: {} (max 15 chars)", iface));
+                return Err(format!("Interface name too long: {iface} (max 15 chars)"));
+            }
+            // Interface binding is not supported on FreeBSD/NetBSD (no SO_BINDTODEVICE / IP_BOUND_IF).
+            // Reject early rather than failing on every probe send at runtime.
+            #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
+            {
+                return Err("Interface binding (-i) is not supported on this platform. \
+                     Use --source-ip or run on Linux/macOS for interface binding."
+                    .to_string());
+            }
+            #[cfg(not(any(target_os = "freebsd", target_os = "netbsd")))]
+            {
+                let _ = iface; // validated above; binding checked later
             }
         }
 
@@ -423,13 +460,96 @@ mod tests {
     }
 
     #[test]
+    fn test_nan_interval_rejected() {
+        let args = make_args(|a| {
+            a.interval = f64::NAN;
+        });
+        assert!(args.validate().unwrap_err().contains("positive, finite"));
+    }
+
+    #[test]
+    fn test_inf_timeout_rejected() {
+        let args = make_args(|a| {
+            a.timeout = f64::INFINITY;
+        });
+        assert!(args.validate().unwrap_err().contains("positive, finite"));
+    }
+
+    #[test]
+    fn test_huge_interval_rejected() {
+        let args = make_args(|a| {
+            a.interval = 1e300;
+        });
+        assert!(args.validate().unwrap_err().contains("too large"));
+    }
+
+    #[test]
+    fn test_huge_timeout_rejected() {
+        let args = make_args(|a| {
+            a.timeout = 1e300;
+        });
+        assert!(args.validate().unwrap_err().contains("too large"));
+    }
+
+    #[test]
+    fn test_port_max_ttl_overflow_rejected() {
+        // port=65530, max_ttl=30 → max port 65560 (overflows u16) unless --fixed-port
+        let args = make_args(|a| {
+            a.protocol = "udp".to_string();
+            a.port = Some(65530);
+            a.max_ttl = 30;
+        });
+        assert!(args.validate().unwrap_err().contains("max 65535"));
+    }
+
+    #[test]
+    fn test_port_max_ttl_valid_at_boundary() {
+        // port=65505, max_ttl=30 → max port 65535 (valid)
+        let args = make_args(|a| {
+            a.protocol = "udp".to_string();
+            a.port = Some(65505);
+            a.max_ttl = 30;
+        });
+        assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn test_default_destination_port_matches_protocol_defaults() {
+        assert_eq!(Args::default_destination_port("tcp"), 80);
+        assert_eq!(Args::default_destination_port("udp"), 33434);
+        assert_eq!(Args::default_destination_port("auto"), 33434);
+    }
+
+    #[test]
+    fn test_port_max_ttl_fixed_port_skips_check() {
+        // With --fixed-port, the per-TTL port variation is disabled
+        let args = make_args(|a| {
+            a.protocol = "udp".to_string();
+            a.port = Some(65530);
+            a.max_ttl = 30;
+            a.port_fixed = true;
+        });
+        assert!(args.validate().is_ok());
+    }
+
+    #[test]
     fn test_timeout_interval_valid() {
-        // timeout=256s with interval=1s is exactly at the limit
+        // timeout=255s with interval=1s is just under the limit (must be < 256 × interval)
+        let args = make_args(|a| {
+            a.timeout = 255.0;
+            a.interval = 1.0;
+        });
+        assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn test_timeout_interval_boundary_rejected() {
+        // timeout=256s with interval=1s is exactly at the limit — now rejected
         let args = make_args(|a| {
             a.timeout = 256.0;
             a.interval = 1.0;
         });
-        assert!(args.validate().is_ok());
+        assert!(args.validate().unwrap_err().contains("sequence wrap"));
     }
 
     #[test]
