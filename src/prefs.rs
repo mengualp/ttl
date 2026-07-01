@@ -57,21 +57,71 @@ impl Prefs {
         dirs::config_dir().map(|p| p.join("ttl").join("config.toml"))
     }
 
-    /// Load preferences from disk (returns default if missing/invalid)
+    /// Load preferences from disk. Logs a warning on corrupt files instead of
+    /// silently resetting.
     pub fn load() -> Self {
-        Self::path()
-            .and_then(|p| fs::read_to_string(p).ok())
-            .and_then(|s| toml::from_str(&s).ok())
-            .unwrap_or_default()
+        match Self::path() {
+            Some(path) => match fs::read_to_string(&path) {
+                Ok(s) => match toml::from_str(&s) {
+                    Ok(prefs) => prefs,
+                    Err(e) => {
+                        eprintln!(
+                            "Warning: could not parse preferences at {}: {}",
+                            path.display(),
+                            e
+                        );
+                        Self::default()
+                    }
+                },
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
+                Err(e) => {
+                    eprintln!(
+                        "Warning: could not read preferences at {}: {}",
+                        path.display(),
+                        e
+                    );
+                    Self::default()
+                }
+            },
+            None => Self::default(),
+        }
     }
 
-    /// Save preferences to disk
+    /// Save preferences to disk with restrictive permissions (0600 on Unix).
     pub fn save(&self) -> anyhow::Result<()> {
         if let Some(path) = Self::path() {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            fs::write(path, toml::to_string_pretty(self)?)?;
+            let data = toml::to_string_pretty(self)?;
+            #[cfg(unix)]
+            {
+                use std::fs::OpenOptions;
+                use std::io::Write;
+                use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+                match fs::metadata(&path) {
+                    Ok(_) => fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(&path)?;
+                file.write_all(data.as_bytes())?;
+                file.sync_all()?;
+
+                // Enforce owner-only permissions for existing files too.
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+            }
+            #[cfg(not(unix))]
+            {
+                fs::write(&path, data)?;
+            }
         }
         Ok(())
     }

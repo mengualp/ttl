@@ -1,13 +1,17 @@
 use std::io::Write;
 
+use crate::lookup::sanitize_display;
 use crate::state::Session;
 
 /// Generate a text report similar to mtr --report
 pub fn generate_report<W: Write>(session: &Session, mut writer: W) -> std::io::Result<()> {
+    // Sanitize user-supplied strings to prevent terminal output injection
+    let target_orig = sanitize_display(&session.target.original);
+    let target_resolved = session.target.resolved.to_string();
     writeln!(
         writer,
         "ttl report for {} ({})",
-        session.target.original, session.target.resolved
+        target_orig, target_resolved
     )?;
     writeln!(
         writer,
@@ -15,7 +19,8 @@ pub fn generate_report<W: Write>(session: &Session, mut writer: W) -> std::io::R
         session.started_at.format("%Y-%m-%d %H:%M:%S UTC")
     )?;
     if let Some(ref iface) = session.config.interface {
-        writeln!(writer, "Interface: {}", iface)?;
+        let safe_iface = sanitize_display(iface);
+        writeln!(writer, "Interface: {}", safe_iface)?;
     }
     writeln!(writer)?;
 

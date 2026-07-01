@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::net::IpAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
@@ -20,6 +20,57 @@ use tokio_util::sync::CancellationToken;
 use super::sanitize_display;
 use crate::state::IxInfo;
 use crate::trace::receiver::SessionMap;
+
+static CACHE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn rename_cache_file(temp: &Path, dest: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        match fs::rename(temp, dest) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Windows rename does not replace existing destinations.
+                let backup = dest.with_file_name(format!(
+                    ".{}.{}.bak",
+                    dest.file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("ix_cache"),
+                    std::process::id()
+                ));
+                match fs::remove_file(&backup) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+
+                fs::rename(dest, &backup)?;
+                match fs::rename(temp, dest) {
+                    Ok(()) => {
+                        let _ = fs::remove_file(&backup);
+                        Ok(())
+                    }
+                    Err(replace_err) => {
+                        if let Err(restore_err) = fs::rename(&backup, dest) {
+                            return Err(anyhow!(
+                                "failed to replace cache file: {}; also failed to restore previous cache: {}",
+                                replace_err,
+                                restore_err
+                            ));
+                        }
+                        Err(replace_err.into())
+                    }
+                }
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        fs::rename(temp, dest)?;
+        Ok(())
+    }
+}
 
 /// PeeringDB API response wrapper
 #[derive(Debug, Deserialize)]
@@ -401,11 +452,26 @@ impl IxLookup {
         Ok(cache)
     }
 
-    /// Save cache to disk
+    /// Save cache to disk via temp file then rename.
     fn save_cache(&self, cache: &IxCache) -> Result<()> {
         let data = serde_json::to_string_pretty(cache)?;
-        fs::write(&self.cache_path, data)?;
-        Ok(())
+        let parent = self
+            .cache_path
+            .parent()
+            .ok_or_else(|| anyhow!("cache path has no parent directory"))?;
+        let nonce = CACHE_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temp = parent.join(format!(
+            ".peeringdb_cache.{}.{}.tmp",
+            std::process::id(),
+            nonce
+        ));
+        fs::write(&temp, &data)?;
+
+        let result = rename_cache_file(&temp, &self.cache_path);
+        if result.is_err() {
+            let _ = fs::remove_file(&temp);
+        }
+        result
     }
 
     /// Populate prefixes from cache
@@ -589,15 +655,18 @@ impl IxLookup {
     /// This spawns a background task to fetch fresh data from PeeringDB.
     /// The refreshing flag is set while the operation is in progress.
     pub fn refresh_cache(self: &Arc<Self>) {
-        if self.refreshing.swap(true, Ordering::SeqCst) {
+        if !self.try_begin_refresh() {
             // Already refreshing
             return;
         }
 
         let this = Arc::clone(self);
         tokio::spawn(async move {
+            // RAII guard ensures refreshing is reset even if the task panics
+            let _guard = scopeguard::guard(Arc::clone(&this), |lookup| {
+                lookup.refreshing.store(false, Ordering::SeqCst);
+            });
             let result = this.refresh_cache_inner().await;
-            this.refreshing.store(false, Ordering::SeqCst);
             if let Err(_e) = result {
                 // Silent failure - IX detection is optional enrichment
                 // Store failure time for backoff
@@ -608,6 +677,10 @@ impl IxLookup {
                 this.last_failure.store(now, Ordering::Relaxed);
             }
         });
+    }
+
+    fn try_begin_refresh(&self) -> bool {
+        !self.refreshing.swap(true, Ordering::SeqCst)
     }
 
     /// Inner refresh logic
@@ -732,6 +805,34 @@ mod tests {
         table
             .lookup(ip.parse().unwrap())
             .map(|info| info.name.clone())
+    }
+
+    fn test_lookup() -> IxLookup {
+        IxLookup {
+            prefixes: RwLock::new(PrefixTable::new()),
+            cache_path: std::env::temp_dir()
+                .join(format!("ix_refresh_gate_{}.json", std::process::id())),
+            load_once: OnceCell::new(),
+            last_failure: AtomicU64::new(0),
+            ip_cache: RwLock::new(HashMap::new()),
+            ip_cache_ttl: Duration::from_secs(3600),
+            ip_cache_times: RwLock::new(HashMap::new()),
+            api_key: RwLock::new(None),
+            cache_fetched_at: AtomicU64::new(0),
+            refreshing: AtomicBool::new(false),
+        }
+    }
+
+    #[test]
+    fn test_try_begin_refresh_sets_flag_and_deduplicates() {
+        let lookup = test_lookup();
+
+        assert!(lookup.try_begin_refresh());
+        assert!(lookup.refreshing.load(Ordering::SeqCst));
+        assert!(!lookup.try_begin_refresh());
+
+        lookup.refreshing.store(false, Ordering::SeqCst);
+        assert!(lookup.try_begin_refresh());
     }
 
     #[test]
