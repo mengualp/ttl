@@ -13,7 +13,7 @@ use crate::probe::{
 use crate::state::{
     IcmpResponseType, MplsLabel, PmtudPhase, ProbeEvent, ProbeId, ProbeOutcome, Session,
 };
-use crate::trace::pending::{PendingMap, PendingProbe};
+use crate::trace::pending::{PendingKey, PendingMap, PendingProbe};
 
 /// Map of target IP to session, shared across multiple engines and the receiver
 pub type SessionMap = Arc<RwLock<HashMap<IpAddr, Arc<RwLock<Session>>>>>;
@@ -111,13 +111,23 @@ impl Receiver {
         probe_id: ProbeId,
         target: IpAddr,
         flow_hint: Option<u8>,
+        is_pmtud_response: bool,
     ) -> Option<PendingProbe> {
         if let Some(flow_id) = flow_hint {
-            if let Some(probe) = pending.remove(&(probe_id, flow_id, target, false)) {
-                return Some(probe);
-            }
-            if let Some(probe) = pending.remove(&(probe_id, flow_id, target, true)) {
-                return Some(probe);
+            if is_pmtud_response {
+                if let Some(probe) = pending.remove(&(probe_id, flow_id, target, true)) {
+                    return Some(probe);
+                }
+                if let Some(probe) = pending.remove(&(probe_id, flow_id, target, false)) {
+                    return Some(probe);
+                }
+            } else {
+                if let Some(probe) = pending.remove(&(probe_id, flow_id, target, false)) {
+                    return Some(probe);
+                }
+                if let Some(probe) = pending.remove(&(probe_id, flow_id, target, true)) {
+                    return Some(probe);
+                }
             }
             return None;
         }
@@ -134,6 +144,12 @@ impl Receiver {
                     normal_flows.push(flow_id);
                 }
             }
+        }
+
+        // If this is a PMTUD-related response (Frag Needed / Packet Too Big),
+        // prefer the PMTUD entry to avoid consuming a normal probe's pending slot.
+        if is_pmtud_response && pmtud_flows.len() == 1 {
+            return pending.remove(&(probe_id, pmtud_flows[0], target, true));
         }
 
         if normal_flows.len() == 1 {
@@ -188,19 +204,29 @@ impl Receiver {
                             identifier,
                             is_dgram,
                         ) {
-                            // Derive flow hint from quoted source port.
-                            // If the port is out of range (e.g., NAT rewrite), keep it unknown
-                            // and only match pending probes when unambiguous.
                             let flow_hint = self.derive_flow_hint(parsed.src_port);
+
+                            // Determine if this response is for a PMTUD probe.
+                            // For Echo Reply: detected via PMTUD payload marker (parsed.is_pmtud).
+                            // For Frag Needed / Packet Too Big: these are always PMTUD responses
+                            // (only PMTUD probes set DF), so also route to PMTUD pending entry.
+                            let is_pmtud_response = parsed.is_pmtud
+                                || matches!(
+                                    parsed.response_type,
+                                    IcmpResponseType::DestUnreachable(4)
+                                        | IcmpResponseType::PacketTooBig
+                                );
 
                             // Find matching pending probe (key includes flow_id, target, is_pmtud)
                             let mut found_probe = None;
                             {
-                                // Read live target list before taking the pending lock
-                                // (targets can be added mid-session in interactive mode;
-                                // sessions lock is never acquired while pending is held)
-                                let fallback_targets: Vec<IpAddr> =
-                                    self.sessions.read().keys().copied().collect();
+                                // Collect target list before acquiring pending. Avoid holding
+                                // sessions and pending locks at the same time.
+                                let fallback_targets: Vec<IpAddr> = {
+                                    let sessions = self.sessions.read();
+                                    sessions.keys().copied().collect()
+                                };
+                                // sessions guard dropped here
 
                                 let mut pending = self.pending.write();
 
@@ -211,6 +237,7 @@ impl Receiver {
                                         parsed.probe_id,
                                         dest,
                                         flow_hint,
+                                        is_pmtud_response,
                                     );
                                 }
 
@@ -222,6 +249,7 @@ impl Receiver {
                                             parsed.probe_id,
                                             *target,
                                             flow_hint,
+                                            is_pmtud_response,
                                         ) {
                                             found_probe = Some(probe);
                                             break;
@@ -427,73 +455,86 @@ impl Receiver {
             // This runs after draining the socket, so queued responses aren't lost
             {
                 let now = Instant::now();
-                let mut pending = self.pending.write();
-                let sessions = self.sessions.read();
                 let timeout = self.config.timeout;
-                // Key is (ProbeId, flow_id, target, is_pmtud) tuple
-                pending.retain(|(probe_id, _flow_id, target, _is_pmtud), probe| {
-                    if now.duration_since(probe.sent_at) > timeout {
-                        let is_pmtud_probe = probe.packet_size.is_some();
 
-                        if let Some(session) = sessions.get(target) {
-                            let mut state = session.write();
+                let timed_out = {
+                    let mut pending = self.pending.write();
+                    let mut timed_out = Vec::new();
 
-                            // Only record hop timeouts for normal probes, not PMTUD probes
-                            if !is_pmtud_probe {
-                                if let Some(hop) = state.hop_mut(probe_id.ttl) {
-                                    hop.record_timeout();
-                                    hop.record_flow_timeout(probe.flow_id);
-                                }
-
-                                // Record event for animated replay (monotonic timing)
-                                let offset_ms = state.offset_ms();
-                                state.record_event(ProbeEvent {
-                                    offset_ms,
-                                    ttl: probe_id.ttl,
-                                    seq: probe_id.seq,
-                                    flow_id: probe.flow_id,
-                                    outcome: ProbeOutcome::Timeout,
-                                });
-                            }
-
-                            // PMTUD: Record failure for timed out PMTUD probes
-                            // Verify packet_size matches current_size to ignore late timeouts from old sizes
-                            if let Some(probe_size) = probe.packet_size
-                                && let Some(ref mut pmtud) = state.pmtud
-                                && pmtud.phase == PmtudPhase::Searching
-                                && probe_size == pmtud.current_size
-                            {
-                                pmtud.record_failure();
-                            }
+                    // Key is (ProbeId, flow_id, target, is_pmtud) tuple
+                    pending.retain(|key, probe| {
+                        if now.duration_since(probe.sent_at) > timeout {
+                            timed_out.push((*key, probe.clone()));
+                            false
+                        } else {
+                            true
                         }
-                        false
-                    } else {
-                        true
-                    }
-                });
+                    });
+
+                    timed_out
+                };
+
+                self.record_pending_timeouts(timed_out, true, true);
             }
         }
 
         Ok(())
     }
 
-    /// Flush all remaining pending probes as timeouts on shutdown.
-    fn flush_pending_as_timeouts(&self) {
-        let mut pending = self.pending.write();
-        let sessions = self.sessions.read();
+    /// Record timeout effects after pending probes have been removed.
+    fn record_pending_timeouts(
+        &self,
+        timed_out: Vec<(PendingKey, PendingProbe)>,
+        record_events: bool,
+        update_pmtud: bool,
+    ) {
+        if timed_out.is_empty() {
+            return;
+        }
 
-        // Drain all remaining probes and record them as timeouts
-        for ((probe_id, _flow_id, target, is_pmtud), probe) in pending.drain() {
+        let sessions = self.sessions.read();
+        for ((probe_id, _flow_id, target, is_pmtud), probe) in timed_out {
             if let Some(session) = sessions.get(&target) {
                 let mut state = session.write();
 
                 // Only record hop timeouts for normal probes, not PMTUD probes
-                if !is_pmtud && let Some(hop) = state.hop_mut(probe_id.ttl) {
-                    hop.record_timeout();
-                    hop.record_flow_timeout(probe.flow_id);
+                if !is_pmtud {
+                    if let Some(hop) = state.hop_mut(probe_id.ttl) {
+                        hop.record_timeout();
+                        hop.record_flow_timeout(probe.flow_id);
+                    }
+
+                    if record_events {
+                        // Record event for animated replay (monotonic timing)
+                        let offset_ms = state.offset_ms();
+                        state.record_event(ProbeEvent {
+                            offset_ms,
+                            ttl: probe_id.ttl,
+                            seq: probe_id.seq,
+                            flow_id: probe.flow_id,
+                            outcome: ProbeOutcome::Timeout,
+                        });
+                    }
+                }
+
+                // PMTUD: Record failure for timed out PMTUD probes. Verify packet_size
+                // matches current_size to ignore late timeouts from old sizes.
+                if update_pmtud
+                    && let Some(probe_size) = probe.packet_size
+                    && let Some(ref mut pmtud) = state.pmtud
+                    && pmtud.phase == PmtudPhase::Searching
+                    && probe_size == pmtud.current_size
+                {
+                    pmtud.record_failure();
                 }
             }
         }
+    }
+
+    /// Flush all remaining pending probes as timeouts on shutdown.
+    fn flush_pending_as_timeouts(&self) {
+        let timed_out: Vec<_> = self.pending.write().drain().collect();
+        self.record_pending_timeouts(timed_out, false, false);
     }
 }
 
@@ -578,7 +619,8 @@ mod tests {
             },
         );
 
-        let removed = Receiver::remove_pending_by_flow_hint(&mut pending, probe_id, target, None);
+        let removed =
+            Receiver::remove_pending_by_flow_hint(&mut pending, probe_id, target, None, false);
         assert!(removed.is_some(), "single candidate should be removable");
         assert!(pending.is_empty());
     }
@@ -601,7 +643,8 @@ mod tests {
             );
         }
 
-        let removed = Receiver::remove_pending_by_flow_hint(&mut pending, probe_id, target, None);
+        let removed =
+            Receiver::remove_pending_by_flow_hint(&mut pending, probe_id, target, None, false);
         assert!(
             removed.is_none(),
             "ambiguous candidates should not be forced"
@@ -635,7 +678,8 @@ mod tests {
             },
         );
 
-        let removed = Receiver::remove_pending_by_flow_hint(&mut pending, probe_id, target, None);
+        let removed =
+            Receiver::remove_pending_by_flow_hint(&mut pending, probe_id, target, None, false);
         assert!(removed.is_some());
         let removed = removed.unwrap();
         assert_eq!(removed.flow_id, 1);
@@ -671,8 +715,126 @@ mod tests {
             },
         );
 
-        let removed = Receiver::remove_pending_by_flow_hint(&mut pending, probe_id, target, None);
+        let removed =
+            Receiver::remove_pending_by_flow_hint(&mut pending, probe_id, target, None, false);
         assert!(removed.is_none());
         assert_eq!(pending.len(), 3);
+    }
+
+    #[test]
+    fn test_remove_pending_explicit_flow_pmtud_response_prefers_pmtud() {
+        let probe_id = ProbeId::new(4, 11);
+        let target = IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 4, 4));
+        let mut pending: HashMap<(ProbeId, u8, IpAddr, bool), PendingProbe> = HashMap::new();
+
+        pending.insert(
+            (probe_id, 0, target, false),
+            PendingProbe {
+                sent_at: Instant::now(),
+                target,
+                flow_id: 0,
+                original_src_port: None,
+                packet_size: None,
+            },
+        );
+        pending.insert(
+            (probe_id, 0, target, true),
+            PendingProbe {
+                sent_at: Instant::now(),
+                target,
+                flow_id: 0,
+                original_src_port: None,
+                packet_size: Some(1400),
+            },
+        );
+
+        let removed =
+            Receiver::remove_pending_by_flow_hint(&mut pending, probe_id, target, Some(0), true);
+        assert!(removed.is_some());
+        assert_eq!(removed.unwrap().packet_size, Some(1400));
+        assert!(pending.contains_key(&(probe_id, 0, target, false)));
+        assert!(!pending.contains_key(&(probe_id, 0, target, true)));
+    }
+
+    #[test]
+    fn test_remove_pending_unknown_flow_pmtud_echo_reply_prefers_pmtud_entry() {
+        // Simulates the critical PMTUD success case: a PMTUD probe reaches the
+        // destination and gets an Echo Reply. Both normal and PMTUD pending entries
+        // share the same (probe_id, target) but differ in is_pmtud flag.
+        // Without the PMTUD marker, the receiver would consume the normal entry
+        // and leave the PMTUD probe to time out.
+        let probe_id = ProbeId::new(5, 3);
+        let target = IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4));
+        let mut pending: HashMap<(ProbeId, u8, IpAddr, bool), PendingProbe> = HashMap::new();
+        pending.insert(
+            (probe_id, 0, target, false),
+            PendingProbe {
+                sent_at: Instant::now(),
+                target,
+                flow_id: 0,
+                original_src_port: None,
+                packet_size: None,
+            },
+        );
+        pending.insert(
+            (probe_id, 0, target, true),
+            PendingProbe {
+                sent_at: Instant::now(),
+                target,
+                flow_id: 0,
+                original_src_port: None,
+                packet_size: Some(1200),
+            },
+        );
+
+        // Echo Reply from PMTUD probe: is_pmtud_response=true via payload marker
+        let removed =
+            Receiver::remove_pending_by_flow_hint(&mut pending, probe_id, target, Some(0), true);
+        assert!(removed.is_some(), "should remove PMTUD entry");
+        assert_eq!(removed.unwrap().packet_size, Some(1200));
+        // Normal entry should remain
+        assert!(pending.contains_key(&(probe_id, 0, target, false)));
+        assert!(!pending.contains_key(&(probe_id, 0, target, true)));
+    }
+
+    #[test]
+    fn test_remove_pending_unknown_flow_pmtud_echo_reply_no_flow_hint() {
+        // Same as above but with unknown flow hint (NAT rewrote the port).
+        // Each entry has a unique flow, so the PMTUD one should be preferred.
+        let probe_id = ProbeId::new(5, 4);
+        let target = IpAddr::V4(std::net::Ipv4Addr::new(5, 6, 7, 8));
+        let mut pending: HashMap<(ProbeId, u8, IpAddr, bool), PendingProbe> = HashMap::new();
+        pending.insert(
+            (probe_id, 1, target, false),
+            PendingProbe {
+                sent_at: Instant::now(),
+                target,
+                flow_id: 1,
+                original_src_port: Some(50001),
+                packet_size: None,
+            },
+        );
+        pending.insert(
+            (probe_id, 2, target, true),
+            PendingProbe {
+                sent_at: Instant::now(),
+                target,
+                flow_id: 2,
+                original_src_port: Some(50002),
+                packet_size: Some(1300),
+            },
+        );
+
+        // PMTUD Echo Reply with unknown flow: should prefer PMTUD entry
+        let removed =
+            Receiver::remove_pending_by_flow_hint(&mut pending, probe_id, target, None, true);
+        assert!(
+            removed.is_some(),
+            "should remove PMTUD entry for Echo Reply"
+        );
+        assert_eq!(removed.unwrap().packet_size, Some(1300));
+        // Normal entry should remain
+        assert!(pending.contains_key(&(probe_id, 1, target, false)));
+        assert!(!pending.contains_key(&(probe_id, 2, target, true)));
     }
 }
