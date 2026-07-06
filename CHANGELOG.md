@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.20.2] - 2026-07-06
+
+### Fixed
+- **Response TTL and return-path estimation on macOS/BSD IPv4** (#117). The hardened control-message parser required a 4-byte `int`, but the BSDs and macOS deliver the IPv4 `IP_RECVTTL` value as a single `u_char` — that 1-byte message was dropped, blanking the reply TTL and the return-hop / path-asymmetry estimate derived from it on those platforms. The value is now read width-aware (4-byte `int` on Linux and for the IPv6 hop-limit, single byte on BSD/macOS IPv4) while preserving the short-message over-read protection. Exercised on real macOS and FreeBSD kernels in CI.
+- **Panic-proofing across the CLI, probe, and TUI paths.** CLI validation rejects out-of-range ports, counts, intervals, and DSCP values and guards `base_port + ttl` / `src_port + flow` overflow with clean errors instead of panicking (#99); arithmetic on clock jumps and oversized packets uses saturating/checked math (#101); the TUI no longer panics on multi-byte (UTF-8) input or cursor editing (#100, #116).
+- **Unsafe socket code hardened against undefined behavior** (#102). Control-message parsing uses unaligned reads and validates `cmsg` lengths before dereferencing, removing potential misaligned reads and out-of-bounds access on malformed ancillary data.
+- **PMTUD correlation, lock ordering, and enrichment dedup** (#104). Corrects a Path MTU Discovery correlation edge case, eliminates an opposing lock-acquisition order in the timeout-cleanup path (deadlock risk), and de-duplicates in-flight enrichment lookups.
+- **IPv6 correctness.** Extension headers inside quoted ICMP error payloads are now parsed so probes correlate correctly (#114, LAN-144), and the interface scope ID is propagated through the receive/bind paths so link-local responders are no longer ambiguous (#113, LAN-143).
+- **Bounded enrichment caches** (#115, LAN-145). The ASN/geo/rDNS/IX response caches are capped at 10,000 entries (expiring by TTL, then evicting oldest) so long-running or high-fan-out traces cannot grow memory without bound.
+- **Replay robustness** (#116, LAN-150/181). Saved-session replay validates its input instead of asserting, and `--replay`/`--diff` are correctly exempt from the live-trace batch validations (e.g. `--replay --json` no longer demands `-c`). Corrupt session durations deserialize to an error rather than panicking.
+- **File security and output hygiene** (#103). Auto-generated export filenames are sanitized (path separators, control characters, and Windows reserved names) to prevent traversal; the preferences file is created and kept at `0600`; enrichment cache files are written atomically (temp + rename); report/CSV output is sanitized.
+- **Export filename length** (#119). A maximum-length FQDN plus the fixed `ttl-<target>-<timestamp>.json` overhead could exceed the 255-byte per-component filesystem limit and fail JSON export with `ENAMETOOLONG`; the target component is now capped on a UTF-8 boundary.
+
+### Dependencies
+- maxminddb 0.28.1 → 0.29.0, clap_complete 4.6.5 → 4.6.7, anyhow 1.0.102 → 1.0.103.
+- CI/release GitHub Actions bumped to current majors: `checkout` v6 → v7, `cache` v5 → v6, and the docker actions `setup-buildx` v3 → v4, `setup-qemu` v3 → v4, `login` v3 → v4, `metadata` v5 → v6, `build-push` v6 → v7.
+
 ## [0.20.1] - 2026-06-27
 
 ### Fixed
