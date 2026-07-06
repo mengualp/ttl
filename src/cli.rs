@@ -263,13 +263,20 @@ impl Args {
 
     /// Validate arguments
     pub fn validate(&mut self) -> Result<(), String> {
+        // Replay/diff modes don't probe — they load saved sessions and
+        // export/diff them. Skip live-probe validations for those modes.
+        let replay_or_diff = self.replay.is_some() || self.diff.is_some();
+
         // Interactive TUI mode supports starting empty (add targets with 'o');
         // every other mode needs at least one target up front
-        if self.targets.is_empty() && (self.is_batch_mode() || self.is_headless()) {
+        if !replay_or_diff
+            && self.targets.is_empty()
+            && (self.is_batch_mode() || self.is_headless())
+        {
             return Err("No targets specified (required for non-interactive modes)".into());
         }
 
-        if self.is_batch_mode() && self.count == 0 {
+        if !replay_or_diff && self.is_batch_mode() && self.count == 0 {
             return Err("Batch output modes (--json, --csv, --report) require -c to be set".into());
         }
 
@@ -427,6 +434,18 @@ impl Args {
                 }
             }
         }
+
+        // Reject nonsensical flag combinations in replay/diff modes.
+        // These modes don't probe, so probing-related flags are meaningless.
+        if self.replay.is_some() || self.diff.is_some() {
+            if self.pmtud {
+                return Err("--pmtud cannot be used with --replay or --diff".into());
+            }
+            if self.jumbo {
+                return Err("--jumbo cannot be used with --replay or --diff".into());
+            }
+        }
+
         Ok(())
     }
 }
@@ -781,5 +800,88 @@ mod tests {
         .unwrap();
         assert!(args.daemon && args.stream_json);
         assert!(args.is_headless());
+    }
+
+    #[test]
+    fn test_pmtud_rejected_with_replay() {
+        let mut args =
+            Args::try_parse_from(["ttl", "--replay", "session.json", "--pmtud"]).unwrap();
+        let err = args.validate().unwrap_err();
+        assert!(
+            err.contains("--pmtud"),
+            "error should mention --pmtud: {err}"
+        );
+    }
+
+    #[test]
+    fn test_jumbo_rejected_with_replay() {
+        // Construct directly so this test exercises the `jumbo` validation branch
+        // rather than being short-circuited by the earlier `pmtud` check.
+        let mut args = make_args(|a| {
+            a.targets.clear();
+            a.replay = Some("session.json".to_string());
+            a.jumbo = true;
+        });
+        let err = args.validate().unwrap_err();
+        assert!(
+            err.contains("--jumbo"),
+            "error should mention --jumbo: {err}"
+        );
+    }
+
+    #[test]
+    fn test_pmtud_rejected_with_diff() {
+        let mut args =
+            Args::try_parse_from(["ttl", "--diff", "a.json", "b.json", "--pmtud"]).unwrap();
+        let err = args.validate().unwrap_err();
+        assert!(
+            err.contains("--pmtud"),
+            "error should mention --pmtud: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_passes_for_plain_replay() {
+        let mut args = Args::try_parse_from(["ttl", "--replay", "session.json"]).unwrap();
+        assert!(args.validate().is_ok(), "plain --replay should validate");
+    }
+
+    #[test]
+    fn test_validate_passes_for_plain_diff() {
+        let mut args = Args::try_parse_from(["ttl", "--diff", "a.json", "b.json"]).unwrap();
+        assert!(args.validate().is_ok(), "plain --diff should validate");
+    }
+
+    #[test]
+    fn test_replay_with_json_validates() {
+        let mut args = Args::try_parse_from(["ttl", "--replay", "session.json", "--json"]).unwrap();
+        assert!(args.validate().is_ok(), "--replay --json should validate");
+    }
+
+    #[test]
+    fn test_replay_with_csv_validates() {
+        let mut args = Args::try_parse_from(["ttl", "--replay", "session.json", "--csv"]).unwrap();
+        assert!(args.validate().is_ok(), "--replay --csv should validate");
+    }
+
+    #[test]
+    fn test_replay_with_report_validates() {
+        let mut args =
+            Args::try_parse_from(["ttl", "--replay", "session.json", "--report"]).unwrap();
+        assert!(args.validate().is_ok(), "--replay --report should validate");
+    }
+
+    #[test]
+    fn test_replay_with_no_tui_validates() {
+        let mut args =
+            Args::try_parse_from(["ttl", "--replay", "session.json", "--no-tui"]).unwrap();
+        assert!(args.validate().is_ok(), "--replay --no-tui should validate");
+    }
+
+    #[test]
+    fn test_diff_with_json_validates() {
+        let mut args =
+            Args::try_parse_from(["ttl", "--diff", "a.json", "b.json", "--json"]).unwrap();
+        assert!(args.validate().is_ok(), "--diff --json should validate");
     }
 }
