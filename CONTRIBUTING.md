@@ -69,6 +69,36 @@ pre-commit install --hook-type pre-commit --hook-type pre-push
 After install, hooks run automatically. To run them manually against staged
 files: `prek run` (or `pre-commit run`).
 
+## Minimum Supported Rust Version (MSRV)
+
+ttl targets a **modest MSRV** rather than tracking the latest stable release. The
+current floor is **Rust 1.88** (edition 2024), declared as `rust-version` in
+`Cargo.toml` and enforced by the `msrv` CI job, which pins
+`dtolnay/rust-toolchain@1.88` and runs `cargo check`.
+
+Policy:
+
+- **MSRV bumps are deliberate and manual — never automated.** Dependabot's
+  `github-actions` group is configured to `ignore` `dtolnay/rust-toolchain`,
+  because that action is tagged by *Rust version*: without the ignore, Dependabot
+  reads the `@1.88` MSRV pin as a stale tag and tries to bump it to the newest
+  Rust, silently defeating the check.
+- **Dependency updates that raise the required Rust are caught, not merged
+  blindly.** If a `cargo` update needs newer than the MSRV, the `msrv` job goes
+  red. That's the decision point: pin the older dependency, or bump the MSRV on
+  purpose. Edition 2024 also uses the MSRV-aware resolver, so `cargo update`
+  prefers versions compatible with `rust-version` when one exists.
+- **When to re-evaluate:** when the `msrv` job forces it, when you genuinely need
+  a language/std feature stabilized after the current floor, or on a loose cadence
+  (a quick glance each minor release). A reasonable "modest" target is the Rust
+  shipped by current Debian stable / Ubuntu LTS, or roughly stable minus ~4
+  releases — don't chase the newest.
+
+To bump the MSRV when warranted, update **both** `rust-version` in `Cargo.toml`
+and the pinned version in the `msrv` job in `.github/workflows/ci.yml` (and the
+`Rust 1.88+` line under Prerequisites above). The `msrv` job then verifies the
+new floor actually builds.
+
 ## Testing
 
 ```bash
