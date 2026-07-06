@@ -16,3 +16,10 @@ updates:
       github-actions:
         patterns:
           - "*"
+    ignore:
+      # dtolnay/rust-toolchain is pinned by Rust *version*, not action version.
+      # @1.88 in the MSRV job = our declared MSRV (Cargo.toml rust-version);
+      # dependabot misreads it as a stale tag and tries to bump it (e.g. #121:
+      # 1.88 -> 1.100), which would silently defeat the MSRV check. Other uses
+      # are @stable. MSRV changes are made by hand.
+      - dependency-name: "dtolnay/rust-toolchain"
