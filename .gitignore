@@ -5,3 +5,6 @@
 .DS_Store
 *.rlib
 .claude/
+
+# Code review state
+.last_review_sha
