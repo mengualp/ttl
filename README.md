@@ -6,7 +6,9 @@
 
 Network diagnostic tool that goes beyond traceroute: MTU discovery, NAT detection, route flap alerts, IX identification, and more.
 
-![ttl screenshot](ttlss.png)
+<p align="center">
+  <img src="docs/demo.gif" alt="ttl live traceroute TUI: hops with ASN and reverse-DNS enrichment, per-hop loss/latency/jitter stats, sparklines, and a hop detail view" width="900">
+</p>
 
 [![Crates.io](https://img.shields.io/crates/v/ttl.svg)](https://crates.io/crates/ttl)
 [![CI](https://github.com/lance0/ttl/actions/workflows/ci.yml/badge.svg)](https://github.com/lance0/ttl/actions/workflows/ci.yml)
