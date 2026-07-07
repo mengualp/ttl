@@ -99,6 +99,12 @@
 
 ---
 
+## Completed (v0.21.0)
+
+- [x] Opt out of the startup update check (#110): `--no-update-check` flag, `DO_NOT_TRACK`/`TTL_NO_UPDATE_CHECK` env vars, `no_update_check` config key, a TUI Settings toggle, and a `--no-default-features` build that compiles the check (and `update-informer`) out entirely
+
+---
+
 ## Planned Features
 
 ### Before next release — TTL send-path correctness (follow-ups to #12)
